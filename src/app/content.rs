@@ -382,6 +382,10 @@ pub(super) fn post_image_key(url: &str) -> String {
     format!("post:{url}")
 }
 
+pub(super) fn detail_image_key(url: &str) -> String {
+    format!("detail:{url}")
+}
+
 /// Extracts a small, ordered set of image links from note content and NIP-92
 /// `imeta` tags. Plain links need a supported file extension; metadata may
 /// identify extensionless image URLs by MIME type.

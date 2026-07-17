@@ -263,8 +263,13 @@ async fn handle_command(
             let url = url.clone();
             let http = http.clone();
             let ui_tx = ui_tx.clone();
+            let target_size = if key.starts_with("detail:") {
+                DETAIL_IMAGE_SIZE
+            } else {
+                CACHED_IMAGE_SIZE
+            };
             tokio::spawn(async move {
-                let image = match fetch_image(&http, &url).await {
+                let image = match fetch_image(&http, &url, target_size).await {
                     Ok(image) => Some(image),
                     Err(error) => {
                         let _ = ui_tx
@@ -340,9 +345,10 @@ async fn handle_command(
 
 mod image;
 
-use image::fetch_image;
 #[cfg(test)]
-use image::{decode_image, CACHED_IMAGE_SIZE};
+use image::decode_image;
+use image::fetch_image;
+use image::{CACHED_IMAGE_SIZE, DETAIL_IMAGE_SIZE};
 mod protocol;
 
 use protocol::{nip08_mentions, short_id, verify_nip05};

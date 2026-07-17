@@ -19,7 +19,7 @@ impl App {
         let mut candidates = Vec::new();
         let mut unique_authors = HashSet::new();
         let mut unique_images = HashSet::new();
-        for event in &self.timeline()[start..end] {
+        for (i, event) in self.timeline()[start..end].iter().enumerate() {
             let display = self.display_event(event);
             let pubkey = display.event.pubkey;
             let key = pubkey.to_hex();
@@ -42,7 +42,12 @@ impl App {
             for url in post_image_urls(&display.event) {
                 let image_key = post_image_key(&url);
                 if unique_images.insert(image_key.clone()) {
-                    candidates.push((image_key, url));
+                    candidates.push((image_key, url.clone()));
+                }
+                // Schedule high-resolution detail images for the selected event
+                if start + i == selected {
+                    let detail_key = detail_image_key(&url);
+                    candidates.push((detail_key, url));
                 }
             }
             if let Some(reactions) = self.reactions.get(&display.event.id.to_string()) {
@@ -205,6 +210,23 @@ impl App {
         url: &str,
     ) -> Option<&mut ratatui_image::protocol::StatefulProtocol> {
         self.images.protocol_mut(&post_image_key(url), url)
+    }
+
+    pub fn detail_post_image_preview_size(
+        &self,
+        url: &str,
+        max_width: u16,
+        max_height: u16,
+    ) -> Option<(u16, u16)> {
+        self.images
+            .preview_size(&detail_image_key(url), url, max_width, max_height)
+    }
+
+    pub fn detail_post_image_protocol_mut(
+        &mut self,
+        url: &str,
+    ) -> Option<&mut ratatui_image::protocol::StatefulProtocol> {
+        self.images.protocol_mut(&detail_image_key(url), url)
     }
 
     pub fn take_deleted_image_ids(&mut self) -> Vec<u32> {

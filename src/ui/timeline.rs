@@ -2,6 +2,7 @@ use super::*;
 
 const POST_IMAGE_MAX_WIDTH: u16 = 24;
 const POST_IMAGE_MAX_HEIGHT: u16 = 8;
+const DETAIL_IMAGE_MAX_HEIGHT: u16 = 24;
 
 pub(super) fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = format!(" {} timeline ", app.active_tab().label());
@@ -245,10 +246,10 @@ pub(super) fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let mut post_images = Vec::new();
     if let Some((url, (width, height))) = rendered.image_urls.iter().find_map(|url| {
-        app.post_image_preview_size(
+        app.detail_post_image_preview_size(
             url,
-            area.width.saturating_sub(2).min(POST_IMAGE_MAX_WIDTH),
-            POST_IMAGE_MAX_HEIGHT,
+            area.width.saturating_sub(2),
+            DETAIL_IMAGE_MAX_HEIGHT,
         )
         .map(|size| (url, size))
     }) {
@@ -336,7 +337,7 @@ pub(super) fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
             (body_area.x, body_area.y),
             body_area,
         );
-        render_post_images(
+        render_detail_post_images(
             frame,
             app,
             &post_images,
@@ -352,6 +353,6 @@ pub(super) fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
             inner,
         );
         render_custom_emojis(frame, app, &content_images, (inner.x, content_y), inner);
-        render_post_images(frame, app, &post_images, (inner.x, content_y), inner);
+        render_detail_post_images(frame, app, &post_images, (inner.x, content_y), inner);
     }
 }
