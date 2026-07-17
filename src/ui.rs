@@ -12,7 +12,7 @@ use ratatui_image::{FilterType, Resize, StatefulImage};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, InputMode, QuoteDisplay, RenderedPart};
+use crate::app::{App, InputMode, QuoteDisplay, RenderedPart, TimelineTab};
 
 const ACCENT: Color = Color::Rgb(180, 140, 255);
 const DIM: Color = Color::Rgb(130, 135, 150);
@@ -61,28 +61,60 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         compact(&app.identity, 18)
     };
-    let header = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "  nostr-ratatui ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(identity, Style::default().fg(Color::Cyan)),
-        Span::raw("  ·  "),
-        Span::styled(&app.status, Style::default().fg(DIM)),
-    ]))
+    let tab = |value: TimelineTab| {
+        let count = app.timeline_count(value);
+        let label = format!(
+            " {} {} ({count}) ",
+            match value {
+                TimelineTab::Following => "1",
+                TimelineTab::Global => "2",
+            },
+            value.label()
+        );
+        if app.active_tab() == value {
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else if value == TimelineTab::Following && !app.following_available() {
+            Span::styled(label, Style::default().fg(Color::DarkGray))
+        } else {
+            Span::styled(label, Style::default().fg(DIM))
+        }
+    };
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                "  nostr-ratatui ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(identity, Style::default().fg(Color::Cyan)),
+            Span::raw("  ·  "),
+            Span::styled(&app.status, Style::default().fg(DIM)),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            tab(TimelineTab::Following),
+            Span::raw(" "),
+            tab(TimelineTab::Global),
+        ]),
+    ])
     .block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(header, area);
 }
 
 fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
-    let mut items = Vec::with_capacity(app.timeline.len());
-    let mut item_heights = Vec::with_capacity(app.timeline.len());
-    let mut authors = Vec::with_capacity(app.timeline.len());
-    for event in &app.timeline {
+    let mut items = Vec::with_capacity(app.timeline().len());
+    let mut item_heights = Vec::with_capacity(app.timeline().len());
+    let mut authors = Vec::with_capacity(app.timeline().len());
+    for event in app.timeline() {
         let display = app.display_event(event);
         let author = app.author_name(&display.event.pubkey);
         let nip05 = app
@@ -127,7 +159,25 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         items.push(ListItem::new(Text::from(lines)));
     }
 
-    let block = Block::default().title(" Timeline ").borders(Borders::ALL);
+    let title = format!(" {} timeline ", app.active_tab().label());
+    let block = Block::default().title(title).borders(Borders::ALL);
+    if app.timeline().is_empty() {
+        let message = if app.active_tab() == TimelineTab::Following && !app.following_available() {
+            "Following timeline requires NOSTR_SECRET_KEY"
+        } else if app.active_tab() == TimelineTab::Following {
+            "No notes from followed accounts yet"
+        } else {
+            "No notes received yet"
+        };
+        frame.render_widget(
+            Paragraph::new(message)
+                .style(Style::default().fg(DIM))
+                .block(block),
+            area,
+        );
+        app.sync_timeline_viewport(0);
+        return;
+    }
     let inner = block.inner(area);
     let list = List::new(items)
         .block(block)
@@ -135,7 +185,7 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(Style::default().bg(Color::Rgb(35, 30, 48)));
     let mut state = ListState::default()
         .with_offset(app.timeline_offset())
-        .with_selected((!app.timeline.is_empty()).then_some(app.selected));
+        .with_selected(Some(app.selected_index()));
     frame.render_stateful_widget(list, area, &mut state);
     app.sync_timeline_viewport(state.offset());
 
@@ -479,7 +529,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         " SETTINGS  m/Esc close  q quit ".to_owned()
     } else if matches!(app.mode, InputMode::Normal) {
         format!(
-            " {timeline_mode}  j/k move  g LIVE/top  G last  l/Enter detail  m settings  i/o post  r reply  +/-/e react  R repost  q quit "
+            " {timeline_mode}  Tab/1/2 timeline  j/k move  g LIVE/top  G last  l/Enter detail  m settings  i/o post  r reply  +/-/e react  R repost  q quit "
         )
     } else {
         format!(" {timeline_mode}  INSERT ")
@@ -642,25 +692,25 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert_eq!(app.selected, 1);
+        assert_eq!(app.selected_index(), 1);
         assert_eq!(app.timeline_offset(), 0);
         assert!(app.is_live());
 
         app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert_eq!(app.selected, 2);
+        assert_eq!(app.selected_index(), 2);
         assert_eq!(app.timeline_offset(), 1);
         assert!(!app.is_live());
 
         app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert_eq!(app.selected, 1);
+        assert_eq!(app.selected_index(), 1);
         assert_eq!(app.timeline_offset(), 1);
         assert!(!app.is_live());
 
         app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected_index(), 0);
         assert_eq!(app.timeline_offset(), 0);
         assert!(app.is_live());
     }

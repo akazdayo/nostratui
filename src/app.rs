@@ -84,9 +84,96 @@ pub enum InputMode {
     Reaction { event: Box<Event> },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineTab {
+    Following,
+    Global,
+}
+
+impl TimelineTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Following => "Following",
+            Self::Global => "Global",
+        }
+    }
+}
+
+#[derive(Default)]
+struct TimelineState {
+    events: Vec<Event>,
+    selected: usize,
+    live: bool,
+    unseen: usize,
+    offset: usize,
+}
+
+impl TimelineState {
+    fn new() -> Self {
+        Self {
+            live: true,
+            ..Self::default()
+        }
+    }
+}
+
+fn add_timeline_event(timeline: &mut TimelineState, event: Event) {
+    let selected_id = timeline.events.get(timeline.selected).map(|event| event.id);
+    let selected_viewport_row = timeline.selected.saturating_sub(timeline.offset);
+    let incoming_id = event.id;
+    timeline.events.push(event);
+    timeline
+        .events
+        .sort_by_key(|event| Reverse(event.created_at));
+    if timeline.live {
+        timeline.selected = 0;
+        resume_timeline(timeline);
+    } else {
+        timeline.selected = selected_id
+            .and_then(|id| timeline.events.iter().position(|event| event.id == id))
+            .unwrap_or_else(|| {
+                timeline
+                    .selected
+                    .min(timeline.events.len().saturating_sub(1))
+            });
+        timeline.offset = timeline.selected.saturating_sub(selected_viewport_row);
+        if timeline
+            .events
+            .iter()
+            .position(|event| event.id == incoming_id)
+            .is_some_and(|position| position < timeline.selected)
+        {
+            timeline.unseen += 1;
+        }
+    }
+}
+
+fn replace_timeline_events(timeline: &mut TimelineState, mut events: Vec<Event>) {
+    let selected_id = timeline.events.get(timeline.selected).map(|event| event.id);
+    events.sort_by_key(|event| Reverse(event.created_at));
+    timeline.events = events;
+    if timeline.live {
+        timeline.selected = 0;
+        timeline.offset = 0;
+    } else {
+        timeline.selected = selected_id
+            .and_then(|id| timeline.events.iter().position(|event| event.id == id))
+            .unwrap_or_else(|| {
+                timeline
+                    .selected
+                    .min(timeline.events.len().saturating_sub(1))
+            });
+        timeline.offset = timeline.offset.min(timeline.selected);
+    }
+}
+
+fn resume_timeline(timeline: &mut TimelineState) {
+    timeline.live = true;
+    timeline.unseen = 0;
+    timeline.offset = 0;
+}
+
 pub struct App {
-    pub timeline: Vec<Event>,
-    pub selected: usize,
     pub profiles: HashMap<String, Profile>,
     pub verified_nip05: HashSet<(String, String)>,
     pub reactions: HashMap<String, Reactions>,
@@ -98,9 +185,11 @@ pub struct App {
     pub read_only: bool,
     settings_open: bool,
     relays: Vec<String>,
-    live: bool,
-    unseen: usize,
-    timeline_offset: usize,
+    active_tab: TimelineTab,
+    following_available: bool,
+    following_pubkeys: HashSet<PublicKey>,
+    following_timeline: TimelineState,
+    global_timeline: TimelineState,
     seen: HashSet<String>,
     pending_nip05: HashSet<(String, String)>,
     pending_profiles: HashSet<String>,
@@ -114,8 +203,6 @@ pub struct App {
 impl App {
     pub fn new(read_only: bool, relays: Vec<String>) -> Self {
         Self {
-            timeline: Vec::new(),
-            selected: 0,
             profiles: HashMap::new(),
             verified_nip05: HashSet::new(),
             reactions: HashMap::new(),
@@ -127,9 +214,15 @@ impl App {
             read_only,
             settings_open: false,
             relays,
-            live: true,
-            unseen: 0,
-            timeline_offset: 0,
+            active_tab: if read_only {
+                TimelineTab::Global
+            } else {
+                TimelineTab::Following
+            },
+            following_available: !read_only,
+            following_pubkeys: HashSet::new(),
+            following_timeline: TimelineState::new(),
+            global_timeline: TimelineState::new(),
             seen: HashSet::new(),
             pending_nip05: HashSet::new(),
             pending_profiles: HashSet::new(),
@@ -148,6 +241,19 @@ impl App {
     pub fn on_ui_event(&mut self, message: UiEvent) -> Option<Command> {
         match message {
             UiEvent::Event(event) => self.add_event(*event),
+            UiEvent::FollowList(pubkeys) => {
+                self.following_available = true;
+                self.following_pubkeys = pubkeys.into_iter().collect();
+                let events = self
+                    .global_timeline
+                    .events
+                    .iter()
+                    .filter(|event| self.following_pubkeys.contains(&event.pubkey))
+                    .cloned()
+                    .collect();
+                replace_timeline_events(&mut self.following_timeline, events);
+                None
+            }
             UiEvent::Profile { pubkey, content } => {
                 if self.profiles.contains_key(&pubkey) {
                     self.pending_profiles.remove(&pubkey);
@@ -225,9 +331,6 @@ impl App {
                 self.apply_profile(pubkey, &event.content)
             }
             Kind::TextNote | Kind::Repost => {
-                let selected_id = self.selected_event().map(|event| event.id);
-                let selected_viewport_row = self.selected.saturating_sub(self.timeline_offset);
-                let incoming_id = event.id;
                 let profile_key = if event.kind == Kind::Repost {
                     Event::from_json(&event.content)
                         .ok()
@@ -236,26 +339,10 @@ impl App {
                 } else {
                     event.pubkey
                 };
-                self.timeline.push(event);
-                self.timeline.sort_by_key(|event| Reverse(event.created_at));
-                if self.live {
-                    self.selected = 0;
-                    self.resume_timeline();
-                } else {
-                    self.selected = selected_id
-                        .and_then(|id| self.timeline.iter().position(|event| event.id == id))
-                        .unwrap_or_else(|| {
-                            self.selected.min(self.timeline.len().saturating_sub(1))
-                        });
-                    self.timeline_offset = self.selected.saturating_sub(selected_viewport_row);
-                    if self
-                        .timeline
-                        .iter()
-                        .position(|event| event.id == incoming_id)
-                        .is_some_and(|position| position < self.selected)
-                    {
-                        self.unseen += 1;
-                    }
+                let is_following = self.following_pubkeys.contains(&event.pubkey);
+                add_timeline_event(&mut self.global_timeline, event.clone());
+                if is_following {
+                    add_timeline_event(&mut self.following_timeline, event);
                 }
                 let key = profile_key.to_hex();
                 if !self.profiles.contains_key(&key) && self.pending_profiles.insert(key) {
@@ -323,26 +410,55 @@ impl App {
     fn on_normal_key(&mut self, key: KeyEvent) -> Option<Command> {
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), _) => Some(Command::Quit),
+            (KeyCode::Tab, _) | (KeyCode::Char(']'), _) => {
+                self.select_tab(match self.active_tab {
+                    TimelineTab::Following => TimelineTab::Global,
+                    TimelineTab::Global => TimelineTab::Following,
+                });
+                None
+            }
+            (KeyCode::BackTab, _) | (KeyCode::Char('['), _) => {
+                self.select_tab(match self.active_tab {
+                    TimelineTab::Following => TimelineTab::Global,
+                    TimelineTab::Global => TimelineTab::Following,
+                });
+                None
+            }
+            (KeyCode::Char('1'), _) => {
+                self.select_tab(TimelineTab::Following);
+                None
+            }
+            (KeyCode::Char('2'), _) => {
+                self.select_tab(TimelineTab::Global);
+                None
+            }
             (KeyCode::Char('m'), _) => {
                 self.settings_open = true;
                 None
             }
             (KeyCode::Char('j') | KeyCode::Down, _) => {
-                self.selected = (self.selected + 1).min(self.timeline.len().saturating_sub(1));
+                let timeline = self.timeline_state_mut();
+                timeline.selected =
+                    (timeline.selected + 1).min(timeline.events.len().saturating_sub(1));
                 None
             }
             (KeyCode::Char('k') | KeyCode::Up, _) => {
-                self.selected = self.selected.saturating_sub(1);
+                let timeline = self.timeline_state_mut();
+                timeline.selected = timeline.selected.saturating_sub(1);
                 None
             }
             (KeyCode::Char('g'), _) => {
-                self.selected = 0;
-                self.resume_timeline();
+                let timeline = self.timeline_state_mut();
+                timeline.selected = 0;
+                resume_timeline(timeline);
                 None
             }
             (KeyCode::Char('G'), _) => {
-                self.pause_timeline();
-                self.selected = self.timeline.len().saturating_sub(1);
+                let timeline = self.timeline_state_mut();
+                if !timeline.events.is_empty() {
+                    timeline.live = false;
+                }
+                timeline.selected = timeline.events.len().saturating_sub(1);
                 None
             }
             (KeyCode::Char('l') | KeyCode::Enter, _) => {
@@ -468,37 +584,67 @@ impl App {
         self.input.clear();
     }
 
-    fn pause_timeline(&mut self) {
-        if !self.timeline.is_empty() {
-            self.live = false;
+    fn timeline_state(&self) -> &TimelineState {
+        match self.active_tab {
+            TimelineTab::Following => &self.following_timeline,
+            TimelineTab::Global => &self.global_timeline,
         }
     }
 
-    fn resume_timeline(&mut self) {
-        self.live = true;
-        self.unseen = 0;
-        self.timeline_offset = 0;
+    fn timeline_state_mut(&mut self) -> &mut TimelineState {
+        match self.active_tab {
+            TimelineTab::Following => &mut self.following_timeline,
+            TimelineTab::Global => &mut self.global_timeline,
+        }
+    }
+
+    pub fn select_tab(&mut self, tab: TimelineTab) {
+        self.active_tab = tab;
+    }
+
+    pub fn active_tab(&self) -> TimelineTab {
+        self.active_tab
+    }
+
+    pub fn following_available(&self) -> bool {
+        self.following_available
+    }
+
+    pub fn timeline(&self) -> &[Event] {
+        &self.timeline_state().events
+    }
+
+    pub fn selected_index(&self) -> usize {
+        self.timeline_state().selected
+    }
+
+    pub fn timeline_count(&self, tab: TimelineTab) -> usize {
+        match tab {
+            TimelineTab::Following => self.following_timeline.events.len(),
+            TimelineTab::Global => self.global_timeline.events.len(),
+        }
     }
 
     pub fn sync_timeline_viewport(&mut self, offset: usize) {
-        self.timeline_offset = offset;
+        let timeline = self.timeline_state_mut();
+        timeline.offset = offset;
         if offset == 0 {
-            self.resume_timeline();
+            resume_timeline(timeline);
         } else {
-            self.live = false;
+            timeline.live = false;
         }
     }
 
     pub fn timeline_offset(&self) -> usize {
-        self.timeline_offset
+        self.timeline_state().offset
     }
 
     pub fn is_live(&self) -> bool {
-        self.live
+        self.timeline_state().live
     }
 
     pub fn unseen_count(&self) -> usize {
-        self.unseen
+        self.timeline_state().unseen
     }
 
     pub fn settings_open(&self) -> bool {
@@ -517,16 +663,17 @@ impl App {
     /// in-flight requests and the decoded image cache are bounded by
     /// `AvatarCache`.
     pub fn avatar_commands(&mut self) -> Vec<Command> {
-        if !self.avatars.is_enabled() || self.timeline.is_empty() {
+        if !self.avatars.is_enabled() || self.timeline().is_empty() {
             return Vec::new();
         }
 
         const VIEWPORT_RADIUS: usize = 12;
-        let start = self.selected.saturating_sub(VIEWPORT_RADIUS);
-        let end = (self.selected + VIEWPORT_RADIUS + 1).min(self.timeline.len());
+        let selected = self.selected_index();
+        let start = selected.saturating_sub(VIEWPORT_RADIUS);
+        let end = (selected + VIEWPORT_RADIUS + 1).min(self.timeline().len());
         let mut candidates = Vec::new();
         let mut unique = HashSet::new();
-        for event in &self.timeline[start..end] {
+        for event in &self.timeline()[start..end] {
             let pubkey = if event.kind == Kind::Repost {
                 Event::from_json(&event.content)
                     .ok()
@@ -565,17 +712,19 @@ impl App {
         const MAX_PENDING_REFERENCES: usize = 4;
 
         let available = MAX_PENDING_REFERENCES.saturating_sub(self.pending_references.len());
-        if self.timeline.is_empty() {
+        if self.timeline().is_empty() {
             return Vec::new();
         }
 
-        let start = self.selected.saturating_sub(VIEWPORT_RADIUS);
-        let end = (self.selected + VIEWPORT_RADIUS + 1).min(self.timeline.len());
+        let selected = self.selected_index();
+        let start = selected.saturating_sub(VIEWPORT_RADIUS);
+        let end = (selected + VIEWPORT_RADIUS + 1).min(self.timeline().len());
+        let viewport_events = self.timeline()[start..end].to_vec();
         let mut ids = Vec::new();
         let mut pubkeys = Vec::new();
         let mut unique = HashSet::new();
         let mut unique_pubkeys = HashSet::new();
-        for event in &self.timeline[start..end] {
+        for event in &viewport_events {
             let display = self.display_event(event);
             let expanded = expand_mentions(&display.event.content, &display.event.tags);
             for entity in content_entities(&expanded) {
@@ -583,7 +732,11 @@ impl App {
                     ContentEntityKind::Event(event_id) => {
                         if unique.insert(event_id)
                             && !self.referenced_events.contains_key(&event_id)
-                            && !self.timeline.iter().any(|event| event.id == event_id)
+                            && !self
+                                .global_timeline
+                                .events
+                                .iter()
+                                .any(|event| event.id == event_id)
                             && !self.requested_references.contains(&event_id)
                         {
                             ids.push(event_id);
@@ -633,7 +786,7 @@ impl App {
     }
 
     pub fn selected_event(&self) -> Option<&Event> {
-        self.timeline.get(self.selected)
+        self.timeline().get(self.selected_index())
     }
 
     pub fn display_event(&self, event: &Event) -> DisplayEvent {
@@ -669,7 +822,12 @@ impl App {
                         event: self
                             .referenced_events
                             .get(&event_id)
-                            .or_else(|| self.timeline.iter().find(|event| event.id == event_id))
+                            .or_else(|| {
+                                self.global_timeline
+                                    .events
+                                    .iter()
+                                    .find(|event| event.id == event_id)
+                            })
                             .cloned(),
                         loading: self.pending_references.contains(&event_id)
                             || !self.requested_references.contains(&event_id),
@@ -704,7 +862,7 @@ impl App {
         } else {
             "?"
         };
-        Some(format!("{marker} {address}"))
+        Some(format!("{marker} {}", display_nip05_address(&address)))
     }
 
     pub fn reaction_summary(&self, event: &Event) -> String {
@@ -767,6 +925,13 @@ fn trim_content_parts(parts: &mut Vec<RenderedPart>) {
             break;
         }
     }
+}
+
+fn display_nip05_address(address: &str) -> &str {
+    address
+        .strip_prefix("_@")
+        .filter(|domain| !domain.is_empty() && !domain.contains('@'))
+        .unwrap_or(address)
 }
 
 pub fn expand_mentions(content: &str, tags: &Tags) -> String {
@@ -1003,6 +1168,26 @@ mod tests {
     }
 
     #[test]
+    fn nip05_root_identifier_is_displayed_as_domain_only() {
+        let pubkey = Keys::generate().public_key();
+        let key = pubkey.to_hex();
+        let address = "_@example.com".to_owned();
+        let mut app = App::new(true, Vec::new());
+        app.profiles.insert(
+            key.clone(),
+            Profile {
+                nip05: Some(address.clone()),
+                ..Profile::default()
+            },
+        );
+
+        assert_eq!(app.nip05_label(&pubkey).as_deref(), Some("? example.com"));
+
+        app.verified_nip05.insert((key, address));
+        assert_eq!(app.nip05_label(&pubkey).as_deref(), Some("✓ example.com"));
+    }
+
+    #[test]
     fn incoming_notes_do_not_change_the_selected_event() {
         let keys = Keys::generate();
         let note = |content, timestamp| {
@@ -1017,11 +1202,11 @@ mod tests {
 
         app.add_event(selected);
         app.add_event(note("older", 50));
-        app.selected = 0;
-        app.live = false;
+        app.global_timeline.selected = 0;
+        app.global_timeline.live = false;
         app.add_event(note("incoming", 200));
 
-        assert_eq!(app.selected, 1);
+        assert_eq!(app.selected_index(), 1);
         assert_eq!(app.unseen_count(), 1);
         assert_eq!(
             app.selected_event().map(|event| event.id),
@@ -1097,16 +1282,67 @@ mod tests {
             .unwrap();
         let event_id = event.id;
         let mut app = App::new(false, Vec::new());
+        app.select_tab(TimelineTab::Global);
 
         app.on_ui_event(UiEvent::Event(Box::new(event.clone())));
         app.on_ui_event(UiEvent::Event(Box::new(event)));
 
-        assert_eq!(app.timeline.len(), 1);
+        assert_eq!(app.timeline().len(), 1);
         assert_eq!(app.selected_event().map(|event| event.id), Some(event_id));
         assert_eq!(
             app.selected_event().map(|event| event.content.as_str()),
             Some("my post")
         );
+    }
+
+    #[test]
+    fn notes_are_routed_to_global_and_following_timelines() {
+        let followed = Keys::generate();
+        let stranger = Keys::generate();
+        let followed_note = EventBuilder::text_note("followed")
+            .sign_with_keys(&followed)
+            .unwrap();
+        let stranger_note = EventBuilder::text_note("global only")
+            .sign_with_keys(&stranger)
+            .unwrap();
+        let mut app = App::new(false, Vec::new());
+
+        app.on_ui_event(UiEvent::FollowList(vec![followed.public_key()]));
+        app.on_ui_event(UiEvent::Event(Box::new(followed_note)));
+        app.on_ui_event(UiEvent::Event(Box::new(stranger_note)));
+
+        assert_eq!(app.timeline_count(TimelineTab::Following), 1);
+        assert_eq!(app.timeline_count(TimelineTab::Global), 2);
+        assert_eq!(app.timeline()[0].content, "followed");
+
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.active_tab(), TimelineTab::Global);
+        assert_eq!(app.timeline().len(), 2);
+    }
+
+    #[test]
+    fn changing_follow_list_rebuilds_the_following_timeline() {
+        let first = Keys::generate();
+        let second = Keys::generate();
+        let mut app = App::new(false, Vec::new());
+        app.on_ui_event(UiEvent::Event(Box::new(
+            EventBuilder::text_note("first")
+                .sign_with_keys(&first)
+                .unwrap(),
+        )));
+        app.on_ui_event(UiEvent::Event(Box::new(
+            EventBuilder::text_note("second")
+                .sign_with_keys(&second)
+                .unwrap(),
+        )));
+
+        app.on_ui_event(UiEvent::FollowList(vec![first.public_key()]));
+        assert_eq!(app.timeline().len(), 1);
+        assert_eq!(app.timeline()[0].content, "first");
+
+        app.on_ui_event(UiEvent::FollowList(vec![second.public_key()]));
+        assert_eq!(app.timeline().len(), 1);
+        assert_eq!(app.timeline()[0].content, "second");
     }
 
     #[test]

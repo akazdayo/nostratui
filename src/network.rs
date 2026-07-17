@@ -18,6 +18,7 @@ pub struct NetworkConfig {
 #[derive(Debug)]
 pub enum UiEvent {
     Event(Box<Event>),
+    FollowList(Vec<PublicKey>),
     Profile {
         pubkey: String,
         content: String,
@@ -57,19 +58,20 @@ async fn run_inner(
     commands: &mut mpsc::Receiver<Command>,
     ui_tx: &mpsc::Sender<UiEvent>,
 ) -> anyhow::Result<()> {
-    let client = match config.secret_key {
+    let (client, own_pubkey) = match config.secret_key {
         Some(secret) => {
             let keys = Keys::parse(&secret)?;
+            let public_key = keys.public_key();
             ui_tx
-                .send(UiEvent::Identity(keys.public_key().to_bech32()?))
+                .send(UiEvent::Identity(public_key.to_bech32()?))
                 .await?;
-            Client::new(keys)
+            (Client::new(keys), Some(public_key))
         }
         None => {
             ui_tx
                 .send(UiEvent::Identity("read-only".to_owned()))
                 .await?;
-            Client::default()
+            (Client::default(), None)
         }
     };
 
@@ -85,10 +87,38 @@ async fn run_inner(
         }
     }
     client.connect().await;
-    let filter = Filter::new()
+    let global_filter = Filter::new()
         .kinds([Kind::Metadata, Kind::TextNote, Kind::Repost, Kind::Reaction])
         .limit(config.limit);
-    client.subscribe(filter, None).await?;
+    client
+        .subscribe_with_id(SubscriptionId::new("global-timeline"), global_filter, None)
+        .await?;
+
+    let following_subscription = SubscriptionId::new("following-timeline");
+    let mut contact_list_timestamp = None;
+    if let Some(pubkey) = own_pubkey {
+        ui_tx.send(UiEvent::FollowList(vec![pubkey])).await?;
+        client
+            .subscribe_with_id(
+                SubscriptionId::new("contact-list"),
+                Filter::new()
+                    .author(pubkey)
+                    .kind(Kind::ContactList)
+                    .limit(1),
+                None,
+            )
+            .await?;
+        client
+            .subscribe_with_id(
+                following_subscription.clone(),
+                Filter::new()
+                    .author(pubkey)
+                    .kinds([Kind::TextNote, Kind::Repost])
+                    .limit(config.limit),
+                None,
+            )
+            .await?;
+    }
     ui_tx
         .send(UiEvent::Status(format!(
             "connected · {} relay(s)",
@@ -107,7 +137,32 @@ async fn run_inner(
             notification = notifications.recv() => {
                 match notification {
                     Ok(RelayPoolNotification::Event { event, .. }) => {
-                        ui_tx.send(UiEvent::Event(event)).await?;
+                        if event.kind == Kind::ContactList && own_pubkey == Some(event.pubkey) {
+                            if contact_list_timestamp.is_none_or(|timestamp| event.created_at > timestamp) {
+                                contact_list_timestamp = Some(event.created_at);
+                                let mut pubkeys: Vec<_> = event.tags.public_keys().copied().collect();
+                                if let Some(pubkey) = own_pubkey {
+                                    pubkeys.push(pubkey);
+                                }
+                                pubkeys.sort_unstable();
+                                pubkeys.dedup();
+                                ui_tx.send(UiEvent::FollowList(pubkeys.clone())).await?;
+
+                                client.unsubscribe(&following_subscription).await;
+                                client
+                                    .subscribe_with_id(
+                                        following_subscription.clone(),
+                                        Filter::new()
+                                            .authors(pubkeys)
+                                            .kinds([Kind::TextNote, Kind::Repost])
+                                            .limit(config.limit),
+                                        None,
+                                    )
+                                    .await?;
+                            }
+                        } else {
+                            ui_tx.send(UiEvent::Event(event)).await?;
+                        }
                     }
                     Ok(_) => {}
                     Err(error) => {
