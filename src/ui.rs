@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
 use ratatui_image::{FilterType, Resize, StatefulImage};
@@ -65,9 +65,9 @@ use presentation::{
 };
 #[cfg(test)]
 use presentation::{content_span, post_image_resize};
-#[cfg(test)]
-use timeline::timeline_render_window;
 use timeline::{draw_detail, draw_timeline};
+#[cfg(test)]
+use timeline::{timeline_render_window, timeline_viewport_offset};
 mod chrome;
 mod editor;
 

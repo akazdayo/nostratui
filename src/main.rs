@@ -3,7 +3,10 @@ mod graphics;
 mod network;
 mod ui;
 
-use std::{io, panic, time::Duration};
+use std::{
+    io, panic,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use app::{App, Command};
@@ -21,6 +24,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
 
 const MAX_TERMINAL_EVENTS_PER_FRAME: usize = 64;
+const SCROLL_EVENT_DEBOUNCE: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -80,6 +84,7 @@ async fn run_app(
     ui_rx: &mut mpsc::Receiver<UiEvent>,
 ) -> Result<()> {
     let mut needs_redraw = true;
+    let mut input_state = TerminalInputState::default();
     loop {
         while let Ok(message) = ui_rx.try_recv() {
             needs_redraw = true;
@@ -112,16 +117,11 @@ async fn run_app(
         if event::poll(Duration::from_millis(50))? {
             let mut events = Vec::with_capacity(MAX_TERMINAL_EVENTS_PER_FRAME);
             events.push(event::read()?);
-            while should_drain_terminal_events(&events) && event::poll(Duration::ZERO)? {
-                let terminal_event = event::read()?;
-                let stops_batch = is_scroll_event(&terminal_event);
-                events.push(terminal_event);
-                if stops_batch {
-                    break;
-                }
+            while events.len() < MAX_TERMINAL_EVENTS_PER_FRAME && event::poll(Duration::ZERO)? {
+                events.push(event::read()?);
             }
 
-            let batch = apply_terminal_events(app, events);
+            let batch = apply_terminal_events(app, events, &mut input_state, Instant::now());
             if batch.quit {
                 return Ok(());
             }
@@ -136,21 +136,49 @@ async fn run_app(
     }
 }
 
-fn should_drain_terminal_events(events: &[TerminalEvent]) -> bool {
-    events.len() < MAX_TERMINAL_EVENTS_PER_FRAME && !events.iter().any(is_scroll_event)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollDirection {
+    Down,
+    Up,
 }
 
-fn is_scroll_event(terminal_event: &TerminalEvent) -> bool {
-    matches!(
-        terminal_event,
-        TerminalEvent::Key(key)
-            if matches!(
-                key.code,
-                crossterm::event::KeyCode::Char('j' | 'k')
-                    | crossterm::event::KeyCode::Down
-                    | crossterm::event::KeyCode::Up
-            )
-    )
+fn scroll_direction(terminal_event: &TerminalEvent) -> Option<ScrollDirection> {
+    let TerminalEvent::Key(key) = terminal_event else {
+        return None;
+    };
+    if key.kind == crossterm::event::KeyEventKind::Release {
+        return None;
+    }
+    match key.code {
+        crossterm::event::KeyCode::Char('j') | crossterm::event::KeyCode::Down => {
+            Some(ScrollDirection::Down)
+        }
+        crossterm::event::KeyCode::Char('k') | crossterm::event::KeyCode::Up => {
+            Some(ScrollDirection::Up)
+        }
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct TerminalInputState {
+    last_scroll: Option<(ScrollDirection, Instant)>,
+}
+
+impl TerminalInputState {
+    fn accepts(&mut self, terminal_event: &TerminalEvent, now: Instant) -> bool {
+        let Some(direction) = scroll_direction(terminal_event) else {
+            return true;
+        };
+        if self.last_scroll.is_some_and(|(last_direction, last_at)| {
+            last_direction == direction
+                && now.saturating_duration_since(last_at) < SCROLL_EVENT_DEBOUNCE
+        }) {
+            return false;
+        }
+        self.last_scroll = Some((direction, now));
+        true
+    }
 }
 
 #[derive(Default)]
@@ -163,9 +191,14 @@ struct TerminalEventBatch {
 fn apply_terminal_events(
     app: &mut App,
     events: impl IntoIterator<Item = TerminalEvent>,
+    input_state: &mut TerminalInputState,
+    now: Instant,
 ) -> TerminalEventBatch {
     let mut batch = TerminalEventBatch::default();
     for terminal_event in events {
+        if !input_state.accepts(&terminal_event, now) {
+            continue;
+        }
         match terminal_event {
             TerminalEvent::Key(key) => {
                 batch.needs_redraw = true;
@@ -238,14 +271,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scroll_event_ends_the_current_redraw_batch() {
-        let scroll = TerminalEvent::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-
-        assert!(!should_drain_terminal_events(&[scroll]));
-    }
-
-    #[test]
-    fn consecutive_scroll_events_are_applied_on_separate_frames() {
+    fn duplicate_scroll_events_apply_only_once() {
         let keys = Keys::generate();
         let mut app = App::new(true, Vec::new());
         for timestamp in 1..=100 {
@@ -255,19 +281,34 @@ mod tests {
                 .unwrap();
             app.on_ui_event(UiEvent::Event(Box::new(event)));
         }
-        let scroll = || {
-            [TerminalEvent::Key(KeyEvent::new(
-                KeyCode::Char('j'),
-                KeyModifiers::NONE,
-            ))]
-        };
+        let scroll = || TerminalEvent::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        let now = Instant::now();
+        let mut input_state = TerminalInputState::default();
 
-        let first_frame = apply_terminal_events(&mut app, scroll());
+        let first_frame = apply_terminal_events(
+            &mut app,
+            [scroll(), scroll(), scroll()],
+            &mut input_state,
+            now,
+        );
         assert_eq!(app.selected_index(), 1);
-        let second_frame = apply_terminal_events(&mut app, scroll());
+        let duplicate_frame = apply_terminal_events(
+            &mut app,
+            [scroll()],
+            &mut input_state,
+            now + SCROLL_EVENT_DEBOUNCE / 2,
+        );
+        assert_eq!(app.selected_index(), 1);
+        let repeat_frame = apply_terminal_events(
+            &mut app,
+            [scroll()],
+            &mut input_state,
+            now + SCROLL_EVENT_DEBOUNCE,
+        );
 
         assert_eq!(app.selected_index(), 2);
         assert!(first_frame.needs_redraw);
-        assert!(second_frame.needs_redraw);
+        assert!(!duplicate_frame.needs_redraw);
+        assert!(repeat_frame.needs_redraw);
     }
 }

@@ -2,6 +2,7 @@ use super::*;
 
 const POST_IMAGE_MAX_WIDTH: u16 = 24;
 const POST_IMAGE_MAX_HEIGHT: u16 = 8;
+const MIN_VISIBLE_ITEM_HEIGHT: u16 = 2;
 
 pub(super) fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = format!(" {} timeline ", app.active_tab().label());
@@ -127,50 +128,95 @@ pub(super) fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         }));
         item_emojis.push(emojis);
         item_post_images.push(post_images);
-        items.push(ListItem::new(Text::from(lines)));
+        items.push(Text::from(lines));
     }
 
-    let list = List::new(items)
-        .block(block)
-        .highlight_symbol("▌ ")
-        .highlight_style(Style::default().bg(Color::Rgb(35, 30, 48)));
     let relative_offset = app
         .timeline_offset()
         .saturating_sub(window_start)
         .min(window_len - 1);
     let relative_selected = selected - window_start;
-    let mut state = ListState::default()
-        .with_offset(relative_offset)
-        .with_selected(Some(relative_selected));
-    frame.render_stateful_widget(list, area, &mut state);
-    app.sync_timeline_viewport(window_start + state.offset());
+    let first = timeline_viewport_offset(
+        &item_heights,
+        relative_offset,
+        relative_selected,
+        inner.height,
+    );
+    app.sync_timeline_viewport(window_start + first);
+    frame.render_widget(block, area);
 
     if inner.width < AVATAR_WIDTH + 2 {
         return;
     }
-    let first = state.offset();
     let mut y = inner.y;
-    for ((((pubkey, avatar_row), height), emojis), post_images) in authors
-        .iter()
-        .zip(item_heights.iter())
-        .zip(item_emojis.iter())
-        .zip(item_post_images.iter())
-        .skip(first)
-    {
-        if y.saturating_add(*height) > inner.bottom() {
+    for index in first..window_len {
+        let available_height = inner.bottom().saturating_sub(y);
+        if available_height < MIN_VISIBLE_ITEM_HEIGHT {
             break;
         }
+        let height = item_heights[index];
+        let visible_height = height.min(available_height);
+        let row_area = Rect::new(inner.x, y, inner.width, visible_height);
+        if index == relative_selected {
+            let highlight_style = Style::default().bg(Color::Rgb(35, 30, 48));
+            frame.buffer_mut().set_style(row_area, highlight_style);
+            frame
+                .buffer_mut()
+                .set_stringn(inner.x, y, "▌ ", 2, highlight_style);
+        }
+        let content_area = Rect::new(
+            inner.x.saturating_add(2),
+            y,
+            inner.width.saturating_sub(2),
+            visible_height,
+        );
+        frame.render_widget(items[index].clone(), content_area);
+
+        let (pubkey, avatar_row) = &authors[index];
         let avatar_area = Rect::new(
             inner.x + 2,
             y.saturating_add(*avatar_row),
             AVATAR_WIDTH,
             AVATAR_HEIGHT,
         );
-        render_avatar(frame, app, pubkey, avatar_area);
-        render_custom_emojis(frame, app, emojis, (inner.x + 2, y), inner);
-        render_post_images(frame, app, post_images, (inner.x + 2, y), inner);
-        y = y.saturating_add(*height);
+        if avatar_area.bottom() <= row_area.bottom() {
+            render_avatar(frame, app, pubkey, avatar_area);
+        }
+        render_custom_emojis(frame, app, &item_emojis[index], (inner.x + 2, y), row_area);
+        render_post_images(
+            frame,
+            app,
+            &item_post_images[index],
+            (inner.x + 2, y),
+            row_area,
+        );
+        y = y.saturating_add(height);
     }
+}
+
+pub(super) fn timeline_viewport_offset(
+    item_heights: &[u16],
+    current_offset: usize,
+    selected: usize,
+    viewport_height: u16,
+) -> usize {
+    let selected = selected.min(item_heights.len().saturating_sub(1));
+    let mut offset = current_offset.min(selected);
+    let mut rows_before_selected = item_heights[offset..selected]
+        .iter()
+        .fold(0_u16, |rows, height| rows.saturating_add(*height));
+    let selected_visible_height = item_heights[selected].min(MIN_VISIBLE_ITEM_HEIGHT);
+
+    // The selected post needs only its header and content rows. Requiring its
+    // full height makes a large image evict several otherwise-visible posts,
+    // while allowing one row leaves a dangling author name at the bottom.
+    while offset < selected
+        && rows_before_selected.saturating_add(selected_visible_height) > viewport_height
+    {
+        rows_before_selected = rows_before_selected.saturating_sub(item_heights[offset]);
+        offset += 1;
+    }
+    offset
 }
 
 pub(super) fn timeline_render_window(

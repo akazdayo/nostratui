@@ -13,7 +13,7 @@ use crate::{
 
 use super::{
     compact, content_span, draw, editor_layout, post_image_resize, timeline_render_window,
-    EditorLayout,
+    timeline_viewport_offset, EditorLayout,
 };
 
 #[test]
@@ -27,6 +27,53 @@ fn timeline_render_window_is_bounded_around_the_selection() {
     assert_eq!(timeline_render_window(5_000, 0, 33), (0, 34));
     assert_eq!(timeline_render_window(5_000, 2_500, 33), (2_467, 2_534));
     assert_eq!(timeline_render_window(5_000, 4_999, 33), (4_966, 5_000));
+}
+
+#[test]
+fn tall_selected_item_does_not_evict_multiple_visible_posts() {
+    let heights = [4, 4, 4, 12, 4];
+
+    assert_eq!(timeline_viewport_offset(&heights, 0, 3, 15), 0);
+    assert_eq!(timeline_viewport_offset(&heights, 0, 3, 13), 1);
+}
+
+#[test]
+fn timeline_does_not_render_an_author_only_bottom_row() {
+    let mut app = App::new(true, Vec::new());
+    for (name, timestamp) in [
+        ("First Author", 400),
+        ("Second Author", 300),
+        ("Third Author", 200),
+        ("Bottom Author", 100),
+    ] {
+        let keys = Keys::generate();
+        app.profiles.insert(
+            keys.public_key().to_hex(),
+            Profile {
+                display_name: Some(name.to_owned()),
+                ..Profile::default()
+            },
+        );
+        let event = EventBuilder::text_note(format!("body by {name}"))
+            .custom_created_at(Timestamp::from_secs(timestamp))
+            .sign_with_keys(&keys)
+            .unwrap();
+        app.on_ui_event(UiEvent::Event(Box::new(event)));
+    }
+    // The timeline has thirteen inner rows. Three regular posts consume
+    // twelve, so the fourth must not render as a one-line author fragment.
+    let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let rendered = (0..buffer.area.height).any(|y| {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>()
+            .contains("Bottom Author")
+    });
+    assert!(!rendered, "an author-only bottom row should be omitted");
 }
 
 #[test]
@@ -94,6 +141,62 @@ fn loaded_image_does_not_advance_timeline_past_selected_item() {
             .contains("newest")
     });
     assert!(rendered, "the selected image note should remain visible");
+}
+
+#[test]
+fn tall_image_post_is_partially_rendered_without_a_multi_post_jump() {
+    let keys = Keys::generate();
+    let image_url = "https://cdn.example.com/tall.webp";
+    let mut app = App::new(true, Vec::new());
+    app.set_image_cache(crate::graphics::ImageCache::kitty_for_test());
+    for (content, timestamp) in [
+        ("first", 500),
+        ("second", 400),
+        ("third", 300),
+        (image_url, 200),
+        ("last", 100),
+    ] {
+        let event = EventBuilder::text_note(content)
+            .custom_created_at(Timestamp::from_secs(timestamp))
+            .sign_with_keys(&keys)
+            .unwrap();
+        app.on_ui_event(UiEvent::Event(Box::new(event)));
+    }
+    let (key, url) = app
+        .image_commands()
+        .into_iter()
+        .find_map(|command| match command {
+            crate::app::Command::FetchImage { key, url } if url == image_url => Some((key, url)),
+            _ => None,
+        })
+        .expect("post image should be requested");
+    app.on_ui_event(UiEvent::Image {
+        key,
+        url,
+        image: Some(::image::DynamicImage::new_rgba8(100, 100)),
+    });
+    for _ in 0..3 {
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    }
+    // The timeline has fifteen inner rows: three regular posts use twelve,
+    // leaving enough room for the selected image post's header and content.
+    let mut terminal = Terminal::new(TestBackend::new(80, 22)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    assert_eq!(app.selected_index(), 3);
+    assert_eq!(app.timeline_offset(), 0);
+    let buffer = terminal.backend().buffer();
+    let rendered = (0..buffer.area.height).any(|y| {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>()
+            .contains(image_url)
+    });
+    assert!(
+        rendered,
+        "the partially visible selected post should render"
+    );
 }
 
 #[test]
