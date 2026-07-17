@@ -99,6 +99,7 @@ pub struct App {
     relays: Vec<String>,
     live: bool,
     unseen: usize,
+    timeline_offset: usize,
     seen: HashSet<String>,
     pending_nip05: HashSet<(String, String)>,
     pending_profiles: HashSet<String>,
@@ -124,6 +125,7 @@ impl App {
             relays,
             live: true,
             unseen: 0,
+            timeline_offset: 0,
             seen: HashSet::new(),
             pending_nip05: HashSet::new(),
             pending_profiles: HashSet::new(),
@@ -205,6 +207,7 @@ impl App {
             }
             Kind::TextNote | Kind::Repost => {
                 let selected_id = self.selected_event().map(|event| event.id);
+                let selected_viewport_row = self.selected.saturating_sub(self.timeline_offset);
                 let incoming_id = event.id;
                 let profile_key = if event.kind == Kind::Repost {
                     Event::from_json(&event.content)
@@ -218,13 +221,14 @@ impl App {
                 self.timeline.sort_by_key(|event| Reverse(event.created_at));
                 if self.live {
                     self.selected = 0;
-                    self.unseen = 0;
+                    self.resume_timeline();
                 } else {
                     self.selected = selected_id
                         .and_then(|id| self.timeline.iter().position(|event| event.id == id))
                         .unwrap_or_else(|| {
                             self.selected.min(self.timeline.len().saturating_sub(1))
                         });
+                    self.timeline_offset = self.selected.saturating_sub(selected_viewport_row);
                     if self
                         .timeline
                         .iter()
@@ -455,14 +459,20 @@ impl App {
     fn resume_timeline(&mut self) {
         self.live = true;
         self.unseen = 0;
+        self.timeline_offset = 0;
     }
 
     pub fn sync_timeline_viewport(&mut self, offset: usize) {
+        self.timeline_offset = offset;
         if offset == 0 && !self.detail {
             self.resume_timeline();
         } else {
             self.live = false;
         }
+    }
+
+    pub fn timeline_offset(&self) -> usize {
+        self.timeline_offset
     }
 
     pub fn is_live(&self) -> bool {

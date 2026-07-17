@@ -128,8 +128,9 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         .block(block)
         .highlight_symbol("▌ ")
         .highlight_style(Style::default().bg(Color::Rgb(35, 30, 48)));
-    let mut state =
-        ListState::default().with_selected((!app.timeline.is_empty()).then_some(app.selected));
+    let mut state = ListState::default()
+        .with_offset(app.timeline_offset())
+        .with_selected((!app.timeline.is_empty()).then_some(app.selected));
     frame.render_stateful_widget(list, area, &mut state);
     app.sync_timeline_viewport(state.offset());
 
@@ -521,16 +522,25 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(app.selected, 1);
+        assert_eq!(app.timeline_offset(), 0);
         assert!(app.is_live());
 
         app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(app.selected, 2);
+        assert_eq!(app.timeline_offset(), 1);
         assert!(!app.is_live());
 
         app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(app.selected, 1);
+        assert_eq!(app.timeline_offset(), 1);
+        assert!(!app.is_live());
+
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.timeline_offset(), 0);
         assert!(app.is_live());
     }
 }
