@@ -48,6 +48,55 @@ fn post_images_are_upscaled_to_the_reserved_preview_area() {
 }
 
 #[test]
+fn loaded_image_does_not_advance_timeline_past_selected_item() {
+    let keys = Keys::generate();
+    let image_url = "https://cdn.example.com/photo.webp";
+    let newest = EventBuilder::text_note(format!("newest {image_url}"))
+        .custom_created_at(Timestamp::from_secs(200))
+        .sign_with_keys(&keys)
+        .unwrap();
+    let older = EventBuilder::text_note("older")
+        .custom_created_at(Timestamp::from_secs(100))
+        .sign_with_keys(&keys)
+        .unwrap();
+    let mut app = App::new(true, Vec::new());
+    app.set_image_cache(crate::graphics::ImageCache::kitty_for_test());
+    app.on_ui_event(UiEvent::Event(Box::new(older)));
+    app.on_ui_event(UiEvent::Event(Box::new(newest)));
+    let (key, url) = app
+        .image_commands()
+        .into_iter()
+        .find_map(|command| match command {
+            crate::app::Command::FetchImage { key, url } if url == image_url => Some((key, url)),
+            _ => None,
+        })
+        .expect("post image should be requested");
+    app.on_ui_event(UiEvent::Image {
+        key,
+        url,
+        image: Some(::image::DynamicImage::new_rgba8(100, 100)),
+    });
+    // The timeline has eight inner rows. Without constraining the image to
+    // the four rows left by the note chrome, the first item grows to twelve
+    // rows and Ratatui advances the viewport to the older item.
+    let mut terminal = Terminal::new(TestBackend::new(80, 15)).unwrap();
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    assert_eq!(app.selected_index(), 0);
+    assert_eq!(app.timeline_offset(), 0);
+    assert!(app.is_live());
+    let buffer = terminal.backend().buffer();
+    let rendered = (0..buffer.area.height).any(|y| {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>()
+            .contains("newest")
+    });
+    assert!(rendered, "the selected image note should remain visible");
+}
+
+#[test]
 fn repost_header_separates_reposter_from_original_author() {
     let original_author = Keys::generate();
     let reposter = Keys::generate();

@@ -76,11 +76,20 @@ pub(super) fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
             lines.extend(quote_lines(app, quote, AVATAR_INDENT));
         }
         let mut post_images = Vec::new();
+        // Ratatui's List does not render an item that is taller than its
+        // viewport. Keep room for the reactions and separator so loading an
+        // image cannot make the selected timeline item disappear and advance
+        // the list offset unexpectedly.
+        let image_max_height = inner
+            .height
+            .saturating_sub(lines.len().min(u16::MAX as usize) as u16)
+            .saturating_sub(2)
+            .min(POST_IMAGE_MAX_HEIGHT);
         if let Some((url, (width, height))) = rendered.image_urls.iter().find_map(|url| {
             app.post_image_preview_size(
                 url,
                 content_width.min(POST_IMAGE_MAX_WIDTH),
-                POST_IMAGE_MAX_HEIGHT,
+                image_max_height,
             )
             .map(|size| (url, size))
         }) {
