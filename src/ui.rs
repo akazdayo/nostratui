@@ -18,7 +18,6 @@ const ACCENT: Color = Color::Rgb(180, 140, 255);
 const DIM: Color = Color::Rgb(130, 135, 150);
 const AVATAR_WIDTH: u16 = 4;
 const AVATAR_HEIGHT: u16 = 2;
-const DETAIL_HEADER_HEIGHT: u16 = 4;
 const AVATAR_INDENT: &str = "      ";
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -126,31 +125,30 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
             .nip05_label(&display.event.pubkey)
             .map(|value| format!("  {value}"))
             .unwrap_or_default();
-        let repost = display
-            .reposted_by
-            .as_ref()
-            .map(|key| format!("↻ {}  ", app.author_name(key)))
-            .unwrap_or_default();
+        let reposted_by = display.reposted_by;
         let reactions =
             compact_content_line(app, &app.rendered_reactions(&display.event), content_width);
         let rendered = app.rendered_content(&display.event);
         let content = compact_content_line(app, &rendered.parts, content_width);
         let mut body = vec![Span::raw(AVATAR_INDENT)];
         body.extend(content.spans);
-        let mut lines = vec![
-            Line::from(vec![
-                Span::raw(AVATAR_INDENT),
-                Span::styled(repost, Style::default().fg(Color::Yellow)),
-                Span::styled(author, Style::default().fg(ACCENT).bold()),
-                Span::styled(nip05, Style::default().fg(Color::Green)),
-                Span::raw("  "),
-                Span::styled(
-                    format_time(display.event.created_at),
-                    Style::default().fg(DIM),
-                ),
-            ]),
-            Line::from(body),
-        ];
+        let mut lines = Vec::new();
+        if let Some(reposter) = reposted_by.as_ref() {
+            lines.push(repost_line(app, reposter, AVATAR_INDENT));
+        }
+        let avatar_row = lines.len() as u16;
+        lines.push(Line::from(vec![
+            Span::raw(AVATAR_INDENT),
+            Span::styled(author, Style::default().fg(ACCENT).bold()),
+            Span::styled(nip05, Style::default().fg(Color::Green)),
+            Span::raw("  "),
+            Span::styled(
+                format_time(display.event.created_at),
+                Style::default().fg(DIM),
+            ),
+        ]));
+        let content_row = lines.len() as u16;
+        lines.push(Line::from(body));
         if let Some(quote) = rendered.quote.as_ref() {
             lines.extend(quote_lines(app, quote, AVATAR_INDENT));
         }
@@ -162,12 +160,12 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         }));
         lines.extend([Line::from(reaction_spans), Line::raw(AVATAR_INDENT)]);
         item_heights.push(lines.len() as u16);
-        authors.push(display.event.pubkey);
+        authors.push((display.event.pubkey, avatar_row));
         let mut emojis = content
             .images
             .into_iter()
             .map(|mut image| {
-                image.row = 1;
+                image.row = content_row;
                 image.column += AVATAR_INDENT.width() as u16;
                 image
             })
@@ -216,7 +214,7 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let first = state.offset();
     let mut y = inner.y;
-    for ((pubkey, height), emojis) in authors
+    for (((pubkey, avatar_row), height), emojis) in authors
         .iter()
         .zip(item_heights.iter())
         .zip(item_emojis.iter())
@@ -225,11 +223,27 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         if y.saturating_add(*height) > inner.bottom() {
             break;
         }
-        let avatar_area = Rect::new(inner.x + 2, y, AVATAR_WIDTH, AVATAR_HEIGHT);
+        let avatar_area = Rect::new(
+            inner.x + 2,
+            y.saturating_add(*avatar_row),
+            AVATAR_WIDTH,
+            AVATAR_HEIGHT,
+        );
         render_avatar(frame, app, pubkey, avatar_area);
         render_custom_emojis(frame, app, emojis, (inner.x + 2, y), inner);
         y = y.saturating_add(*height);
     }
+}
+
+fn repost_line(app: &App, reposter: &PublicKey, indent: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(indent.to_owned()),
+        Span::styled("↻ Reposted by ", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            app.author_name(reposter),
+            Style::default().fg(Color::Yellow).bold(),
+        ),
+    ])
 }
 
 fn quote_lines(app: &App, quote: &QuoteDisplay, indent: &str) -> Vec<Line<'static>> {
@@ -461,13 +475,17 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
         .unwrap_or_else(|_| display.event.id.to_string());
     let profile = app.profiles.get(&display.event.pubkey.to_hex());
     let about = profile.and_then(|value| value.about.clone());
-    let mut header_lines = vec![
+    let mut header_lines = Vec::new();
+    if let Some(reposter) = display.reposted_by.as_ref() {
+        header_lines.push(repost_line(app, reposter, ""));
+    }
+    header_lines.extend([
         Line::styled(
             app.author_name(&display.event.pubkey),
             Style::default().fg(ACCENT).bold(),
         ),
         Line::styled(pubkey, Style::default().fg(Color::Cyan)),
-    ];
+    ]);
     if let Some(nip05) = app.nip05_label(&display.event.pubkey) {
         header_lines.push(Line::styled(nip05, Style::default().fg(Color::Green)));
     }
@@ -518,16 +536,17 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let detail_header_height = (header_lines.len() as u16).max(AVATAR_HEIGHT);
 
     if app.kitty_images_enabled()
         && inner.width >= AVATAR_WIDTH + 10
-        && inner.height > DETAIL_HEADER_HEIGHT
+        && inner.height > detail_header_height
     {
         let header_area = Rect::new(
             inner.x + AVATAR_WIDTH + 2,
             inner.y,
             inner.width - AVATAR_WIDTH - 2,
-            DETAIL_HEADER_HEIGHT,
+            detail_header_height,
         );
         frame.render_widget(
             Paragraph::new(header_lines).wrap(Wrap { trim: false }),
@@ -541,9 +560,9 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
         );
         let body_area = Rect::new(
             inner.x,
-            inner.y + DETAIL_HEADER_HEIGHT,
+            inner.y + detail_header_height,
             inner.width,
-            inner.height - DETAIL_HEADER_HEIGHT,
+            inner.height - detail_header_height,
         );
         frame.render_widget(
             Paragraph::new(body_lines).wrap(Wrap { trim: false }),
@@ -815,7 +834,10 @@ mod tests {
         Terminal,
     };
 
-    use crate::{app::App, network::UiEvent};
+    use crate::{
+        app::{App, Profile},
+        network::UiEvent,
+    };
 
     use super::{compact, content_span, draw, editor_layout, EditorLayout};
 
@@ -833,6 +855,56 @@ mod tests {
         assert_eq!(mention.style.fg, Some(Color::Cyan));
         assert!(mention.style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(body.style.fg, None);
+    }
+
+    #[test]
+    fn repost_header_separates_reposter_from_original_author() {
+        let original_author = Keys::generate();
+        let reposter = Keys::generate();
+        let original = EventBuilder::text_note("original body")
+            .sign_with_keys(&original_author)
+            .unwrap();
+        let repost = EventBuilder::repost(&original, None)
+            .sign_with_keys(&reposter)
+            .unwrap();
+        let mut app = App::new(true, Vec::new());
+        app.profiles.insert(
+            original_author.public_key().to_hex(),
+            Profile {
+                display_name: Some("Original Author".to_owned()),
+                ..Profile::default()
+            },
+        );
+        app.profiles.insert(
+            reposter.public_key().to_hex(),
+            Profile {
+                display_name: Some("Alice".to_owned()),
+                ..Profile::default()
+            },
+        );
+        app.on_ui_event(UiEvent::Event(Box::new(repost)));
+        let mut terminal = Terminal::new(TestBackend::new(80, 15)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rows = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let repost_row = rows
+            .iter()
+            .position(|row| row.contains("Reposted by Alice"))
+            .unwrap();
+        let original_row = rows
+            .iter()
+            .position(|row| row.contains("Original Author"))
+            .unwrap();
+
+        assert_eq!(original_row, repost_row + 1);
     }
 
     #[test]
