@@ -101,7 +101,7 @@ fn incoming_notes_do_not_change_the_selected_event() {
 }
 
 #[test]
-fn live_timeline_follows_newest_and_g_resumes_it() {
+fn live_timeline_updates_do_not_change_the_selected_event() {
     let keys = Keys::generate();
     let note = |content, timestamp| {
         EventBuilder::text_note(content)
@@ -121,14 +121,36 @@ fn live_timeline_follows_newest_and_g_resumes_it() {
         Some("first")
     );
 
-    app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+    app.sync_timeline_viewport(0);
+    let selected_id = app.selected_event().map(|event| event.id);
     app.add_event(note("new while live", 300));
 
     assert!(app.is_live());
     assert_eq!(app.unseen_count(), 0);
+    assert_eq!(app.timeline_offset(), 0);
+    assert_eq!(app.selected_index(), 2);
+    assert_eq!(app.selected_event().map(|event| event.id), selected_id);
+}
+
+#[test]
+fn live_timeline_keeps_following_the_latest_event_when_it_is_selected() {
+    let keys = Keys::generate();
+    let note = |content, timestamp| {
+        EventBuilder::text_note(content)
+            .custom_created_at(Timestamp::from_secs(timestamp))
+            .sign_with_keys(&keys)
+            .unwrap()
+    };
+    let mut app = App::new(true, Vec::new());
+    app.add_event(note("first", 100));
+
+    app.add_event(note("new latest", 200));
+
+    assert!(app.is_live());
+    assert_eq!(app.selected_index(), 0);
     assert_eq!(
         app.selected_event().map(|event| event.content.as_str()),
-        Some("new while live")
+        Some("new latest")
     );
 }
 

@@ -121,22 +121,27 @@ impl TimelineState {
 fn add_timeline_event(timeline: &mut TimelineState, event: Event) {
     let selected_id = timeline.events.get(timeline.selected).map(|event| event.id);
     let selected_viewport_row = timeline.selected.saturating_sub(timeline.offset);
+    let was_live = timeline.live;
+    let was_following_latest = was_live && timeline.selected == 0;
     let incoming_id = event.id;
     timeline.events.push(event);
     timeline
         .events
         .sort_by_key(|event| Reverse(event.created_at));
-    if timeline.live {
-        timeline.selected = 0;
-        resume_timeline(timeline);
+    timeline.selected = if was_following_latest {
+        0
     } else {
-        timeline.selected = selected_id
+        selected_id
             .and_then(|id| timeline.events.iter().position(|event| event.id == id))
             .unwrap_or_else(|| {
                 timeline
                     .selected
                     .min(timeline.events.len().saturating_sub(1))
-            });
+            })
+    };
+    if was_live {
+        resume_timeline(timeline);
+    } else {
         timeline.offset = timeline.selected.saturating_sub(selected_viewport_row);
         if timeline
             .events
@@ -151,19 +156,24 @@ fn add_timeline_event(timeline: &mut TimelineState, event: Event) {
 
 fn replace_timeline_events(timeline: &mut TimelineState, mut events: Vec<Event>) {
     let selected_id = timeline.events.get(timeline.selected).map(|event| event.id);
+    let was_live = timeline.live;
+    let was_following_latest = was_live && timeline.selected == 0;
     events.sort_by_key(|event| Reverse(event.created_at));
     timeline.events = events;
-    if timeline.live {
-        timeline.selected = 0;
-        timeline.offset = 0;
+    timeline.selected = if was_following_latest {
+        0
     } else {
-        timeline.selected = selected_id
+        selected_id
             .and_then(|id| timeline.events.iter().position(|event| event.id == id))
             .unwrap_or_else(|| {
                 timeline
                     .selected
                     .min(timeline.events.len().saturating_sub(1))
-            });
+            })
+    };
+    if was_live {
+        resume_timeline(timeline);
+    } else {
         timeline.offset = timeline.offset.min(timeline.selected);
     }
 }
