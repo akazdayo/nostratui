@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use nostr_sdk::prelude::*;
 use serde::Deserialize;
 
-use crate::{graphics::AvatarCache, network::UiEvent};
+use crate::{graphics::ImageCache, network::UiEvent};
 
 #[derive(Debug)]
 pub enum Command {
@@ -26,8 +26,8 @@ pub enum Command {
     },
     FetchProfile(PublicKey),
     FetchEvent(EventId),
-    FetchAvatar {
-        pubkey: String,
+    FetchImage {
+        key: String,
         url: String,
     },
     Quit,
@@ -47,6 +47,7 @@ pub struct Reactions {
     pub likes: usize,
     pub dislikes: usize,
     pub custom: HashMap<String, usize>,
+    pub custom_emojis: HashMap<String, String>,
 }
 
 impl Reactions {
@@ -197,7 +198,7 @@ pub struct App {
     requested_references: HashSet<EventId>,
     pending_references: HashSet<EventId>,
     profile_timestamps: HashMap<String, Timestamp>,
-    avatars: AvatarCache,
+    images: ImageCache,
 }
 
 impl App {
@@ -230,12 +231,12 @@ impl App {
             requested_references: HashSet::new(),
             pending_references: HashSet::new(),
             profile_timestamps: HashMap::new(),
-            avatars: AvatarCache::default(),
+            images: ImageCache::default(),
         }
     }
 
-    pub fn set_avatar_cache(&mut self, avatars: AvatarCache) {
-        self.avatars = avatars;
+    pub fn set_image_cache(&mut self, images: ImageCache) {
+        self.images = images;
     }
 
     pub fn on_ui_event(&mut self, message: UiEvent) -> Option<Command> {
@@ -294,17 +295,8 @@ impl App {
                 }
                 None
             }
-            UiEvent::Avatar { pubkey, url, image } => {
-                let is_current = self
-                    .profiles
-                    .get(&pubkey)
-                    .and_then(|profile| profile.picture.as_deref())
-                    == Some(url.as_str());
-                if is_current {
-                    self.avatars.complete(pubkey, url, image);
-                } else {
-                    self.avatars.discard_completion(&pubkey, &url);
-                }
+            UiEvent::Image { key, url, image } => {
+                self.images.complete(key, url, image);
                 None
             }
         }
@@ -330,10 +322,9 @@ impl App {
                     .insert(pubkey.clone(), event.created_at);
                 self.apply_profile(pubkey, &event.content)
             }
-            Kind::TextNote | Kind::Repost => {
-                let profile_key = if event.kind == Kind::Repost {
-                    Event::from_json(&event.content)
-                        .ok()
+            Kind::TextNote | Kind::Repost | Kind::GenericRepost => {
+                let profile_key = if is_repost(&event) {
+                    embedded_repost(&event)
                         .map(|original| original.pubkey)
                         .unwrap_or(event.pubkey)
                 } else {
@@ -353,10 +344,17 @@ impl App {
             }
             Kind::Reaction => {
                 if let Some(target) = event.tags.event_ids().next() {
-                    self.reactions
-                        .entry(target.to_string())
-                        .or_default()
-                        .add(&event.content);
+                    let custom_emoji = used_custom_emojis(&event)
+                        .into_iter()
+                        .find(|emoji| event.content == format!(":{}:", emoji.shortcode));
+                    let reactions = self.reactions.entry(target.to_string()).or_default();
+                    reactions.add(&event.content);
+                    if let Some(emoji) = custom_emoji {
+                        reactions
+                            .custom_emojis
+                            .entry(emoji.shortcode)
+                            .or_insert(emoji.url);
+                    }
                 }
                 None
             }
@@ -380,8 +378,8 @@ impl App {
                 None
             }
         });
-        self.avatars
-            .profile_updated(&pubkey, profile.picture.as_deref());
+        self.images
+            .source_updated(&avatar_image_key(&pubkey), profile.picture.as_deref());
         self.profiles.insert(pubkey, profile);
         verification
     }
@@ -474,7 +472,7 @@ impl App {
                 None
             }
             (KeyCode::Char('r'), _) => {
-                if let Some(event) = self.selected_event().cloned() {
+                if let Some(event) = self.selected_content_event() {
                     self.begin_compose(Some(Box::new(event)));
                 }
                 None
@@ -484,7 +482,7 @@ impl App {
                     self.status = "read-only: set NOSTR_SECRET_KEY to react".to_owned();
                     return None;
                 }
-                self.selected_event().cloned().map(|event| Command::React {
+                self.selected_content_event().map(|event| Command::React {
                     event: Box::new(event),
                     reaction: "+".to_owned(),
                 })
@@ -494,7 +492,7 @@ impl App {
                     self.status = "read-only: set NOSTR_SECRET_KEY to react".to_owned();
                     return None;
                 }
-                self.selected_event().cloned().map(|event| Command::React {
+                self.selected_content_event().map(|event| Command::React {
                     event: Box::new(event),
                     reaction: "-".to_owned(),
                 })
@@ -504,7 +502,7 @@ impl App {
                     self.status = "read-only: set NOSTR_SECRET_KEY to react".to_owned();
                     return None;
                 }
-                if let Some(event) = self.selected_event().cloned() {
+                if let Some(event) = self.selected_content_event() {
                     self.mode = InputMode::Reaction {
                         event: Box::new(event),
                     };
@@ -517,8 +515,7 @@ impl App {
                     self.status = "read-only: set NOSTR_SECRET_KEY to repost".to_owned();
                     None
                 } else {
-                    self.selected_event()
-                        .cloned()
+                    self.selected_content_event()
                         .map(|event| Command::Repost(Box::new(event)))
                 }
             }
@@ -656,14 +653,13 @@ impl App {
     }
 
     pub fn kitty_images_enabled(&self) -> bool {
-        self.avatars.is_enabled()
+        self.images.is_enabled()
     }
 
-    /// Schedules only authors near the current viewport. Both the number of
-    /// in-flight requests and the decoded image cache are bounded by
-    /// `AvatarCache`.
-    pub fn avatar_commands(&mut self) -> Vec<Command> {
-        if !self.avatars.is_enabled() || self.timeline().is_empty() {
+    /// Schedules only images near the current viewport. Both the number of
+    /// in-flight requests and the decoded image cache are bounded.
+    pub fn image_commands(&mut self) -> Vec<Command> {
+        if !self.images.is_enabled() || self.timeline().is_empty() {
             return Vec::new();
         }
 
@@ -672,35 +668,44 @@ impl App {
         let start = selected.saturating_sub(VIEWPORT_RADIUS);
         let end = (selected + VIEWPORT_RADIUS + 1).min(self.timeline().len());
         let mut candidates = Vec::new();
-        let mut unique = HashSet::new();
+        let mut unique_authors = HashSet::new();
+        let mut unique_images = HashSet::new();
         for event in &self.timeline()[start..end] {
-            let pubkey = if event.kind == Kind::Repost {
-                Event::from_json(&event.content)
-                    .ok()
-                    .map(|original| original.pubkey)
-                    .unwrap_or(event.pubkey)
-            } else {
-                event.pubkey
-            };
+            let display = self.display_event(event);
+            let pubkey = display.event.pubkey;
             let key = pubkey.to_hex();
-            if !unique.insert(key.clone()) {
-                continue;
+            if unique_authors.insert(key.clone()) {
+                if let Some(url) = self
+                    .profiles
+                    .get(&key)
+                    .and_then(|profile| profile.picture.clone())
+                {
+                    candidates.push((avatar_image_key(&key), url));
+                }
             }
-            if let Some(url) = self
-                .profiles
-                .get(&key)
-                .and_then(|profile| profile.picture.clone())
-            {
-                candidates.push((key, url));
+
+            for emoji in used_custom_emojis(&display.event) {
+                let image_key = emoji_image_key(&emoji.url);
+                if unique_images.insert(image_key.clone()) {
+                    candidates.push((image_key, emoji.url));
+                }
+            }
+            if let Some(reactions) = self.reactions.get(&display.event.id.to_string()) {
+                for url in reactions.custom_emojis.values() {
+                    let image_key = emoji_image_key(url);
+                    if unique_images.insert(image_key.clone()) {
+                        candidates.push((image_key, url.clone()));
+                    }
+                }
             }
         }
 
         candidates
             .into_iter()
-            .filter_map(|(pubkey, url)| {
-                self.avatars
-                    .request(&pubkey, &url)
-                    .then_some(Command::FetchAvatar { pubkey, url })
+            .filter_map(|(key, url)| {
+                self.images
+                    .request(&key, &url)
+                    .then_some(Command::FetchImage { key, url })
             })
             .collect()
     }
@@ -726,6 +731,33 @@ impl App {
         let mut unique_pubkeys = HashSet::new();
         for event in &viewport_events {
             let display = self.display_event(event);
+            for pubkey in [Some(display.event.pubkey), display.reposted_by]
+                .into_iter()
+                .flatten()
+            {
+                let key = pubkey.to_hex();
+                if unique_pubkeys.insert(key.clone())
+                    && !self.profiles.contains_key(&key)
+                    && !self.pending_profiles.contains(&key)
+                {
+                    pubkeys.push((key, pubkey));
+                }
+            }
+            if is_repost(event) && display.event.id == event.id {
+                if let Some(event_id) = repost_target_id(event) {
+                    if unique.insert(event_id)
+                        && !self.referenced_events.contains_key(&event_id)
+                        && !self
+                            .global_timeline
+                            .events
+                            .iter()
+                            .any(|event| event.id == event_id)
+                        && !self.requested_references.contains(&event_id)
+                    {
+                        ids.push(event_id);
+                    }
+                }
+            }
             let expanded = expand_mentions(&display.event.content, &display.event.tags);
             for entity in content_entities(&expanded) {
                 match entity.kind {
@@ -774,29 +806,64 @@ impl App {
     ) -> Option<&mut ratatui_image::protocol::StatefulProtocol> {
         let key = pubkey.to_hex();
         let url = self.profiles.get(&key)?.picture.clone()?;
-        self.avatars.protocol_mut(&key, &url)
+        self.images.protocol_mut(&avatar_image_key(&key), &url)
     }
 
-    pub fn take_deleted_avatar_ids(&mut self) -> Vec<u32> {
-        self.avatars.take_deleted_ids()
+    pub fn custom_emoji_ready(&self, emoji: &CustomEmoji) -> bool {
+        self.images
+            .has_protocol(&emoji_image_key(&emoji.url), &emoji.url)
     }
 
-    pub fn clear_avatars(&mut self) {
-        self.avatars.clear();
+    pub fn custom_emoji_protocol_mut(
+        &mut self,
+        emoji: &CustomEmoji,
+    ) -> Option<&mut ratatui_image::protocol::StatefulProtocol> {
+        self.images
+            .protocol_mut(&emoji_image_key(&emoji.url), &emoji.url)
+    }
+
+    pub fn take_deleted_image_ids(&mut self) -> Vec<u32> {
+        self.images.take_deleted_ids()
+    }
+
+    pub fn clear_images(&mut self) {
+        self.images.clear();
     }
 
     pub fn selected_event(&self) -> Option<&Event> {
         self.timeline().get(self.selected_index())
     }
 
+    fn selected_content_event(&self) -> Option<Event> {
+        let selected = self.selected_event()?;
+        let display = self.display_event(selected);
+        (!is_repost(selected) || display.event.id != selected.id).then_some(display.event)
+    }
+
     pub fn display_event(&self, event: &Event) -> DisplayEvent {
-        if event.kind == Kind::Repost {
-            if let Ok(original) = Event::from_json(&event.content) {
+        if is_repost(event) {
+            let original = embedded_repost(event).or_else(|| {
+                let target = repost_target_id(event)?;
+                self.referenced_events
+                    .get(&target)
+                    .or_else(|| {
+                        self.global_timeline
+                            .events
+                            .iter()
+                            .find(|candidate| candidate.id == target)
+                    })
+                    .cloned()
+            });
+            if let Some(original) = original {
                 return DisplayEvent {
                     event: original,
                     reposted_by: Some(event.pubkey),
                 };
             }
+            return DisplayEvent {
+                event: event.clone(),
+                reposted_by: Some(event.pubkey),
+            };
         }
         DisplayEvent {
             event: event.clone(),
@@ -841,6 +908,7 @@ impl App {
         }
         push_content_part(&mut parts, &content[cursor..], false);
         trim_content_parts(&mut parts);
+        parts = emojify_parts(parts, &custom_emoji_tags(&event.tags));
 
         RenderedContent { parts, quote }
     }
@@ -865,11 +933,18 @@ impl App {
         Some(format!("{marker} {}", display_nip05_address(&address)))
     }
 
-    pub fn reaction_summary(&self, event: &Event) -> String {
-        self.reactions
-            .get(&event.id.to_string())
-            .map(Reactions::summary)
-            .unwrap_or_default()
+    pub fn rendered_reactions(&self, event: &Event) -> Vec<RenderedPart> {
+        let Some(reactions) = self.reactions.get(&event.id.to_string()) else {
+            return Vec::new();
+        };
+        emojify_parts(
+            vec![RenderedPart {
+                text: reactions.summary(),
+                mention: false,
+                emoji: None,
+            }],
+            &reactions.custom_emojis,
+        )
     }
 }
 
@@ -883,15 +958,45 @@ pub struct RenderedContent {
     pub quote: Option<QuoteDisplay>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedPart {
     pub text: String,
     pub mention: bool,
+    pub emoji: Option<CustomEmoji>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomEmoji {
+    pub shortcode: String,
+    pub url: String,
 }
 
 pub struct QuoteDisplay {
     pub event_id: EventId,
     pub event: Option<Event>,
     pub loading: bool,
+}
+
+fn is_repost(event: &Event) -> bool {
+    matches!(event.kind, Kind::Repost | Kind::GenericRepost)
+}
+
+fn repost_target_id(event: &Event) -> Option<EventId> {
+    is_repost(event)
+        .then(|| event.tags.event_ids().next().copied())
+        .flatten()
+}
+
+fn embedded_repost(event: &Event) -> Option<Event> {
+    if !is_repost(event) {
+        return None;
+    }
+    let original = Event::from_json(&event.content)
+        .ok()
+        .filter(|original| original.verify().is_ok())?;
+    repost_target_id(event)
+        .is_none_or(|target| target == original.id)
+        .then_some(original)
 }
 
 fn push_content_part(parts: &mut Vec<RenderedPart>, text: &str, mention: bool) {
@@ -904,8 +1009,119 @@ fn push_content_part(parts: &mut Vec<RenderedPart>, text: &str, mention: bool) {
         parts.push(RenderedPart {
             text: text.to_owned(),
             mention,
+            emoji: None,
         });
     }
+}
+
+fn push_emoji_part(parts: &mut Vec<RenderedPart>, emoji: CustomEmoji) {
+    parts.push(RenderedPart {
+        text: format!(":{}:", emoji.shortcode),
+        mention: false,
+        emoji: Some(emoji),
+    });
+}
+
+fn custom_emoji_tags(tags: &Tags) -> HashMap<String, String> {
+    let mut emojis = HashMap::new();
+    for tag in tags.iter().filter(|tag| tag.kind() == TagKind::Emoji) {
+        let values = tag.as_slice();
+        let (Some(shortcode), Some(url)) = (values.get(1), values.get(2)) else {
+            continue;
+        };
+        if shortcode.is_empty()
+            || shortcode.len() > 64
+            || !shortcode.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
+        {
+            continue;
+        }
+        emojis
+            .entry(shortcode.clone())
+            .or_insert_with(|| url.clone());
+    }
+    emojis
+}
+
+fn used_custom_emojis(event: &Event) -> Vec<CustomEmoji> {
+    let tags = custom_emoji_tags(&event.tags);
+    let mut used = Vec::new();
+    let mut seen = HashSet::new();
+    for (_, _, shortcode) in custom_emoji_references(&event.content, &tags) {
+        if seen.insert(shortcode.clone()) {
+            if let Some(url) = tags.get(&shortcode) {
+                used.push(CustomEmoji {
+                    shortcode,
+                    url: url.clone(),
+                });
+            }
+        }
+    }
+    used
+}
+
+fn emojify_parts(
+    parts: Vec<RenderedPart>,
+    emoji_tags: &HashMap<String, String>,
+) -> Vec<RenderedPart> {
+    if emoji_tags.is_empty() {
+        return parts;
+    }
+    let mut output = Vec::new();
+    for part in parts {
+        if part.mention || part.emoji.is_some() {
+            output.push(part);
+            continue;
+        }
+        let mut cursor = 0;
+        for (start, end, shortcode) in custom_emoji_references(&part.text, emoji_tags) {
+            push_content_part(&mut output, &part.text[cursor..start], false);
+            let url = emoji_tags
+                .get(&shortcode)
+                .expect("custom emoji reference came from the tag map")
+                .clone();
+            push_emoji_part(&mut output, CustomEmoji { shortcode, url });
+            cursor = end;
+        }
+        push_content_part(&mut output, &part.text[cursor..], false);
+    }
+    output
+}
+
+fn custom_emoji_references(
+    content: &str,
+    emoji_tags: &HashMap<String, String>,
+) -> Vec<(usize, usize, String)> {
+    let mut references = Vec::new();
+    let mut cursor = 0;
+    while cursor < content.len() {
+        let Some(relative_start) = content[cursor..].find(':') else {
+            break;
+        };
+        let start = cursor + relative_start;
+        let candidate_start = start + 1;
+        let Some(relative_end) = content[candidate_start..].find(':') else {
+            break;
+        };
+        let end = candidate_start + relative_end;
+        let shortcode = &content[candidate_start..end];
+        if emoji_tags.contains_key(shortcode) {
+            references.push((start, end + 1, shortcode.to_owned()));
+            cursor = end + 1;
+        } else {
+            cursor = candidate_start;
+        }
+    }
+    references
+}
+
+fn avatar_image_key(pubkey: &str) -> String {
+    format!("avatar:{pubkey}")
+}
+
+fn emoji_image_key(url: &str) -> String {
+    format!("emoji:{url}")
 }
 
 fn trim_content_parts(parts: &mut Vec<RenderedPart>) {
@@ -1095,6 +1311,81 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_tagged_nip30_custom_emoji() {
+        let event = EventBuilder::text_note("hello :blob-cat: :missing:")
+            .tags([Tag::parse(["emoji", "blob-cat", "https://example.com/blob-cat.png"]).unwrap()])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let app = App::new(true, Vec::new());
+
+        let rendered = app.rendered_content(&event);
+        let emoji = rendered
+            .parts
+            .iter()
+            .find_map(|part| part.emoji.as_ref())
+            .unwrap();
+
+        assert_eq!(emoji.shortcode, "blob-cat");
+        assert_eq!(emoji.url, "https://example.com/blob-cat.png");
+        assert_eq!(
+            rendered
+                .parts
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect::<String>(),
+            "hello :blob-cat: :missing:"
+        );
+    }
+
+    #[test]
+    fn custom_emoji_download_completion_becomes_renderable() {
+        let url = "https://emoji.invalid/party.png";
+        let event = EventBuilder::text_note(":party:")
+            .tags([Tag::parse(["emoji", "party", url]).unwrap()])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let mut app = App::new(true, Vec::new());
+        app.set_image_cache(ImageCache::kitty_for_test());
+        app.on_ui_event(UiEvent::Event(Box::new(event.clone())));
+
+        let command = app
+            .image_commands()
+            .into_iter()
+            .find(|command| matches!(command, Command::FetchImage { .. }))
+            .unwrap();
+        let Command::FetchImage { key, url } = command else {
+            unreachable!();
+        };
+        assert_eq!(url, "https://emoji.invalid/party.png");
+        app.on_ui_event(UiEvent::Image {
+            key,
+            url,
+            image: Some(::image::DynamicImage::new_rgba8(16, 16)),
+        });
+
+        let rendered = app.rendered_content(&event);
+        let emoji = rendered
+            .parts
+            .iter()
+            .find_map(|part| part.emoji.as_ref())
+            .unwrap();
+        assert!(app.custom_emoji_ready(emoji));
+    }
+
+    #[test]
+    fn custom_emoji_parser_skips_url_colons_and_finds_later_shortcode() {
+        let tags = HashMap::from([(
+            "party".to_owned(),
+            "https://example.com/party.png".to_owned(),
+        )]);
+
+        assert_eq!(
+            custom_emoji_references("https://example.com :party:", &tags),
+            vec![(20, 27, "party".to_owned())]
+        );
+    }
+
+    #[test]
     fn parses_nevent_and_renders_fetched_quote() {
         let quoted = EventBuilder::text_note("quoted body")
             .sign_with_keys(&Keys::generate())
@@ -1159,12 +1450,121 @@ mod tests {
     }
 
     #[test]
+    fn renders_embedded_repost_as_the_original_note() {
+        let original = EventBuilder::text_note("original body")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let reposter = Keys::generate();
+        let repost = EventBuilder::repost(&original, None)
+            .sign_with_keys(&reposter)
+            .unwrap();
+        let mut app = App::new(true, Vec::new());
+
+        app.on_ui_event(UiEvent::Event(Box::new(repost.clone())));
+        let display = app.display_event(&repost);
+
+        assert_eq!(display.event.id, original.id);
+        assert_eq!(display.event.content, "original body");
+        assert_eq!(display.reposted_by, Some(reposter.public_key()));
+    }
+
+    #[test]
+    fn fetches_and_renders_repost_with_missing_embedded_event() {
+        let original = EventBuilder::text_note("fetched body")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let reposter = Keys::generate();
+        let repost = EventBuilder::new(Kind::Repost, "")
+            .tags([Tag::event(original.id), Tag::public_key(original.pubkey)])
+            .sign_with_keys(&reposter)
+            .unwrap();
+        let mut app = App::new(true, Vec::new());
+        app.on_ui_event(UiEvent::Event(Box::new(repost.clone())));
+
+        assert!(app
+            .reference_commands()
+            .iter()
+            .any(|command| matches!(command, Command::FetchEvent(id) if *id == original.id)));
+
+        app.on_ui_event(UiEvent::ReferencedEvent {
+            event_id: original.id,
+            event: Some(Box::new(original.clone())),
+        });
+        let display = app.display_event(&repost);
+
+        assert_eq!(display.event.id, original.id);
+        assert_eq!(display.event.content, "fetched body");
+        assert_eq!(display.reposted_by, Some(reposter.public_key()));
+    }
+
+    #[test]
+    fn renders_generic_repost_and_targets_original_for_actions() {
+        let original = EventBuilder::new(Kind::LongFormTextNote, "long-form body")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let reposter = Keys::generate();
+        let repost = EventBuilder::repost(&original, None)
+            .sign_with_keys(&reposter)
+            .unwrap();
+        assert_eq!(repost.kind, Kind::GenericRepost);
+
+        let mut app = App::new(false, Vec::new());
+        app.select_tab(TimelineTab::Global);
+        app.on_ui_event(UiEvent::Event(Box::new(repost.clone())));
+
+        let display = app.display_event(&repost);
+        assert_eq!(display.event.id, original.id);
+        assert_eq!(display.reposted_by, Some(reposter.public_key()));
+
+        let command = app
+            .on_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(
+            command,
+            Command::React { event, .. } if event.id == original.id
+        ));
+    }
+
+    #[test]
     fn reaction_summary_is_stable() {
         let mut reactions = Reactions::default();
         reactions.add("🔥");
         reactions.add("+");
         reactions.add("🔥");
         assert_eq!(reactions.summary(), "+1 🔥2");
+    }
+
+    #[test]
+    fn custom_reaction_is_exposed_as_a_renderable_emoji() {
+        let event = EventBuilder::text_note("target")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let mut reactions = Reactions::default();
+        reactions.add(":party:");
+        reactions.add(":party:");
+        reactions.custom_emojis.insert(
+            "party".to_owned(),
+            "https://example.com/party.png".to_owned(),
+        );
+        let mut app = App::new(true, Vec::new());
+        app.reactions.insert(event.id.to_string(), reactions);
+
+        let rendered = app.rendered_reactions(&event);
+
+        assert_eq!(
+            rendered
+                .iter()
+                .find_map(|part| part.emoji.as_ref())
+                .map(|emoji| emoji.shortcode.as_str()),
+            Some("party")
+        );
+        assert_eq!(
+            rendered
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect::<String>(),
+            ":party:2"
+        );
     }
 
     #[test]

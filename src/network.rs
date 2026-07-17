@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io::Cursor, time::Duration};
 
-use ::image::{imageops::FilterType, DynamicImage, ImageReader, Limits};
+use ::image::{imageops::FilterType, DynamicImage, ImageReader, Limits, RgbaImage};
 use nostr_sdk::prelude::*;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
@@ -29,8 +29,8 @@ pub enum UiEvent {
         address: String,
         verified: bool,
     },
-    Avatar {
-        pubkey: String,
+    Image {
+        key: String,
         url: String,
         image: Option<DynamicImage>,
     },
@@ -88,7 +88,13 @@ async fn run_inner(
     }
     client.connect().await;
     let global_filter = Filter::new()
-        .kinds([Kind::Metadata, Kind::TextNote, Kind::Repost, Kind::Reaction])
+        .kinds([
+            Kind::Metadata,
+            Kind::TextNote,
+            Kind::Repost,
+            Kind::GenericRepost,
+            Kind::Reaction,
+        ])
         .limit(config.limit);
     client
         .subscribe_with_id(SubscriptionId::new("global-timeline"), global_filter, None)
@@ -113,7 +119,7 @@ async fn run_inner(
                 following_subscription.clone(),
                 Filter::new()
                     .author(pubkey)
-                    .kinds([Kind::TextNote, Kind::Repost])
+                    .kinds([Kind::TextNote, Kind::Repost, Kind::GenericRepost])
                     .limit(config.limit),
                 None,
             )
@@ -154,7 +160,11 @@ async fn run_inner(
                                         following_subscription.clone(),
                                         Filter::new()
                                             .authors(pubkeys)
-                                            .kinds([Kind::TextNote, Kind::Repost])
+                                            .kinds([
+                                                Kind::TextNote,
+                                                Kind::Repost,
+                                                Kind::GenericRepost,
+                                            ])
                                             .limit(config.limit),
                                         None,
                                     )
@@ -248,14 +258,22 @@ async fn handle_command(
             });
             return;
         }
-        Command::FetchAvatar { pubkey, url } => {
-            let pubkey = pubkey.clone();
+        Command::FetchImage { key, url } => {
+            let key = key.clone();
             let url = url.clone();
             let http = http.clone();
             let ui_tx = ui_tx.clone();
             tokio::spawn(async move {
-                let image = fetch_avatar(&http, &url).await.ok();
-                let _ = ui_tx.send(UiEvent::Avatar { pubkey, url, image }).await;
+                let image = match fetch_image(&http, &url).await {
+                    Ok(image) => Some(image),
+                    Err(error) => {
+                        let _ = ui_tx
+                            .send(UiEvent::Status(format!("image load failed: {error:#}")))
+                            .await;
+                        None
+                    }
+                };
+                let _ = ui_tx.send(UiEvent::Image { key, url, image }).await;
             });
             return;
         }
@@ -297,7 +315,7 @@ async fn handle_command(
         Command::VerifyNip05 { .. }
         | Command::FetchProfile(_)
         | Command::FetchEvent(_)
-        | Command::FetchAvatar { .. }
+        | Command::FetchImage { .. }
         | Command::Quit => unreachable!(),
     };
 
@@ -308,46 +326,54 @@ async fn handle_command(
     let _ = ui_tx.send(UiEvent::Status(status)).await;
 }
 
-const MAX_AVATAR_DOWNLOAD_BYTES: usize = 2 * 1024 * 1024;
-const MAX_AVATAR_DIMENSION: u32 = 2_048;
-const MAX_AVATAR_DECODE_ALLOC: u64 = 32 * 1024 * 1024;
-const CACHED_AVATAR_SIZE: u32 = 128;
+const MAX_IMAGE_DOWNLOAD_BYTES: usize = 2 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION: u32 = 2_048;
+const MAX_IMAGE_DECODE_ALLOC: u64 = 32 * 1024 * 1024;
+const CACHED_IMAGE_SIZE: u32 = 128;
 
-async fn fetch_avatar(http: &HttpClient, url: &str) -> anyhow::Result<DynamicImage> {
+async fn fetch_image(http: &HttpClient, url: &str) -> anyhow::Result<DynamicImage> {
     let mut response = http.get(url).send().await?.error_for_status()?;
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_AVATAR_DOWNLOAD_BYTES as u64)
+        .is_some_and(|length| length > MAX_IMAGE_DOWNLOAD_BYTES as u64)
     {
-        anyhow::bail!("avatar response exceeds download limit");
+        anyhow::bail!("image response exceeds download limit");
     }
 
     let capacity = response
         .content_length()
         .and_then(|length| usize::try_from(length).ok())
         .unwrap_or(0)
-        .min(MAX_AVATAR_DOWNLOAD_BYTES);
+        .min(MAX_IMAGE_DOWNLOAD_BYTES);
     let mut bytes = Vec::with_capacity(capacity);
     while let Some(chunk) = response.chunk().await? {
-        if bytes.len().saturating_add(chunk.len()) > MAX_AVATAR_DOWNLOAD_BYTES {
-            anyhow::bail!("avatar response exceeds download limit");
+        if bytes.len().saturating_add(chunk.len()) > MAX_IMAGE_DOWNLOAD_BYTES {
+            anyhow::bail!("image response exceeds download limit");
         }
         bytes.extend_from_slice(&chunk);
     }
     if bytes.is_empty() {
-        anyhow::bail!("empty avatar response");
+        anyhow::bail!("empty image response");
     }
 
-    tokio::task::spawn_blocking(move || decode_avatar(bytes))
+    tokio::task::spawn_blocking(move || decode_image(bytes))
         .await
-        .map_err(|error| anyhow::anyhow!("avatar decoder task failed: {error}"))?
+        .map_err(|error| anyhow::anyhow!("image decoder task failed: {error}"))?
 }
 
-fn decode_avatar(bytes: Vec<u8>) -> anyhow::Result<DynamicImage> {
+fn decode_image(bytes: Vec<u8>) -> anyhow::Result<DynamicImage> {
+    decode_raster_image(&bytes).or_else(|raster_error| {
+        decode_svg_image(&bytes).map_err(|svg_error| {
+            anyhow::anyhow!("unsupported raster image ({raster_error}); invalid SVG ({svg_error})")
+        })
+    })
+}
+
+fn decode_raster_image(bytes: &[u8]) -> anyhow::Result<DynamicImage> {
     let mut limits = Limits::default();
-    limits.max_image_width = Some(MAX_AVATAR_DIMENSION);
-    limits.max_image_height = Some(MAX_AVATAR_DIMENSION);
-    limits.max_alloc = Some(MAX_AVATAR_DECODE_ALLOC);
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_IMAGE_DECODE_ALLOC);
 
     let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     reader.limits(limits);
@@ -356,9 +382,43 @@ fn decode_avatar(bytes: Vec<u8>) -> anyhow::Result<DynamicImage> {
     // dropped before the event crosses into the UI task.
     Ok(DynamicImage::ImageRgba8(
         image
-            .resize(CACHED_AVATAR_SIZE, CACHED_AVATAR_SIZE, FilterType::Triangle)
+            .resize(CACHED_IMAGE_SIZE, CACHED_IMAGE_SIZE, FilterType::Triangle)
             .to_rgba8(),
     ))
+}
+
+fn decode_svg_image(bytes: &[u8]) -> anyhow::Result<DynamicImage> {
+    // `from_data_nested` deliberately ignores external file references. The
+    // SVG itself is untrusted relay content and must not read local resources.
+    let tree = resvg::usvg::Tree::from_data_nested(bytes, &resvg::usvg::Options::default())?;
+    let source_size = tree.size();
+    let source_width = source_size.width();
+    let source_height = source_size.height();
+    if !source_width.is_finite()
+        || !source_height.is_finite()
+        || source_width <= 0.0
+        || source_height <= 0.0
+        || source_width > MAX_IMAGE_DIMENSION as f32
+        || source_height > MAX_IMAGE_DIMENSION as f32
+    {
+        anyhow::bail!("SVG dimensions are invalid or exceed the limit");
+    }
+
+    let scale =
+        (CACHED_IMAGE_SIZE as f32 / source_width).min(CACHED_IMAGE_SIZE as f32 / source_height);
+    let width = (source_width * scale).round().max(1.0) as u32;
+    let height = (source_height * scale).round().max(1.0) as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
+        .ok_or_else(|| anyhow::anyhow!("could not allocate SVG pixmap"))?;
+    let transform = resvg::tiny_skia::Transform::from_scale(
+        width as f32 / source_width,
+        height as f32 / source_height,
+    );
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    let pixels = pixmap.take_demultiplied();
+    let image = RgbaImage::from_raw(width, height, pixels)
+        .ok_or_else(|| anyhow::anyhow!("SVG renderer returned an invalid pixel buffer"))?;
+    Ok(DynamicImage::ImageRgba8(image))
 }
 
 #[derive(Debug, Deserialize)]
@@ -460,7 +520,7 @@ mod tests {
     use ::image::{DynamicImage, ImageFormat};
     use nostr_sdk::prelude::*;
 
-    use super::{decode_avatar, nip08_mentions, short_id, CACHED_AVATAR_SIZE};
+    use super::{decode_image, nip08_mentions, short_id, CACHED_IMAGE_SIZE};
 
     #[test]
     fn short_ids_are_safe() {
@@ -485,24 +545,46 @@ mod tests {
     }
 
     #[test]
-    fn avatar_decoder_normalizes_retained_size() {
+    fn image_decoder_normalizes_retained_size() {
         let mut encoded = Cursor::new(Vec::new());
         DynamicImage::new_rgba8(512, 256)
             .write_to(&mut encoded, ImageFormat::Png)
             .unwrap();
 
-        let decoded = decode_avatar(encoded.into_inner()).unwrap();
-        assert!(decoded.width() <= CACHED_AVATAR_SIZE);
-        assert!(decoded.height() <= CACHED_AVATAR_SIZE);
+        let decoded = decode_image(encoded.into_inner()).unwrap();
+        assert!(decoded.width() <= CACHED_IMAGE_SIZE);
+        assert!(decoded.height() <= CACHED_IMAGE_SIZE);
     }
 
     #[test]
-    fn avatar_decoder_rejects_excessive_dimensions() {
+    fn image_decoder_rejects_excessive_dimensions() {
         let mut encoded = Cursor::new(Vec::new());
         DynamicImage::new_rgba8(2_049, 1)
             .write_to(&mut encoded, ImageFormat::Png)
             .unwrap();
 
-        assert!(decode_avatar(encoded.into_inner()).is_err());
+        assert!(decode_image(encoded.into_inner()).is_err());
+    }
+
+    #[test]
+    fn image_decoder_rasterizes_svg_custom_emoji() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="16">
+            <rect width="32" height="16" fill="#ff0000"/>
+        </svg>"##;
+
+        let decoded = decode_image(svg.to_vec()).unwrap();
+
+        assert_eq!(decoded.width(), CACHED_IMAGE_SIZE);
+        assert_eq!(decoded.height(), CACHED_IMAGE_SIZE / 2);
+        let pixel = decoded.to_rgba8().get_pixel(64, 32).0;
+        assert!(pixel[0] > 240);
+        assert!(pixel[1] < 16);
+        assert_eq!(pixel[3], 255);
+    }
+
+    #[test]
+    fn image_decoder_rejects_oversized_svg_dimensions() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="2049" height="16"/>"#;
+        assert!(decode_image(svg.to_vec()).is_err());
     }
 }

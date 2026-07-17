@@ -11,20 +11,20 @@ use ratatui_image::{
     protocol::{StatefulProtocol, StatefulProtocolType},
 };
 
-const MAX_CACHED_AVATARS: usize = 32;
-const MAX_PENDING_AVATARS: usize = 4;
+const MAX_CACHED_IMAGES: usize = 64;
+const MAX_PENDING_IMAGES: usize = 8;
 
 struct CacheEntry {
     url: String,
     protocol: Option<StatefulProtocol>,
 }
 
-/// A bounded avatar cache. `None` protocols are negative cache entries.
+/// A bounded terminal-image cache. `None` protocols are negative cache entries.
 ///
 /// Kitty keeps transmitted image data in the terminal, so evicted IDs are
 /// returned to the caller and explicitly deleted between terminal frames.
 #[derive(Default)]
-pub struct AvatarCache {
+pub struct ImageCache {
     picker: Option<Picker>,
     entries: HashMap<String, CacheEntry>,
     least_recently_used: VecDeque<String>,
@@ -32,11 +32,28 @@ pub struct AvatarCache {
     deleted_ids: Vec<u32>,
 }
 
-impl AvatarCache {
-    /// Detects terminal capabilities. Avatars are enabled only when Kitty is
+impl ImageCache {
+    /// Detects terminal capabilities. Images are enabled only when Kitty is
     /// selected; other terminals retain the text-only UI.
     pub fn detect() -> Result<Self, ratatui_image::errors::Errors> {
-        let picker = Picker::from_query_stdio()?;
+        let kitty_from_env = kitty_terminal_from_env_values(
+            env::var("TERM").ok().as_deref(),
+            env::var("TERM_PROGRAM").ok().as_deref(),
+            env::var("KITTY_WINDOW_ID").ok().as_deref(),
+        );
+        let mut picker = match Picker::from_query_stdio() {
+            Ok(picker) => picker,
+            Err(_) if kitty_from_env => Picker::from_fontsize((10, 20)),
+            Err(error) => return Err(error),
+        };
+        // Some Kitty-compatible terminals (notably Ghostty in mediated PTYs)
+        // answer the graphics query but not
+        // the cell-size query. ratatui-image then falls back to Halfblocks and
+        // loses the successful graphics result, so use Kitty's own environment
+        // markers as a conservative fallback.
+        if picker.protocol_type() != ProtocolType::Kitty && kitty_from_env {
+            picker.set_protocol_type(ProtocolType::Kitty);
+        }
         if picker.protocol_type() != ProtocolType::Kitty {
             return Ok(Self::default());
         }
@@ -50,7 +67,17 @@ impl AvatarCache {
         self.picker.is_some()
     }
 
-    pub fn request(&mut self, pubkey: &str, url: &str) -> bool {
+    #[cfg(test)]
+    pub fn kitty_for_test() -> Self {
+        let mut picker = Picker::from_fontsize((10, 20));
+        picker.set_protocol_type(ProtocolType::Kitty);
+        Self {
+            picker: Some(picker),
+            ..Self::default()
+        }
+    }
+
+    pub fn request(&mut self, key: &str, url: &str) -> bool {
         if !self.is_enabled()
             || url.len() > 2_048
             || !url
@@ -59,86 +86,71 @@ impl AvatarCache {
         {
             return false;
         }
-        if self
-            .entries
-            .get(pubkey)
-            .is_some_and(|entry| entry.url == url)
-        {
-            self.touch(pubkey);
+        if self.entries.get(key).is_some_and(|entry| entry.url == url) {
+            self.touch(key);
             return false;
         }
-        if self
-            .pending
-            .get(pubkey)
-            .is_some_and(|pending| pending == url)
-            || self.pending.len() >= MAX_PENDING_AVATARS
+        if self.pending.get(key).is_some_and(|pending| pending == url)
+            || self.pending.len() >= MAX_PENDING_IMAGES
         {
             return false;
         }
 
-        // At most one request per author. If a profile changed while its old
-        // image was loading, the new URL will be picked up after it completes.
-        if self.pending.contains_key(pubkey) {
+        // At most one request per logical image. If its URL changed while the
+        // old image was loading, the new URL is picked up after it completes.
+        if self.pending.contains_key(key) {
             return false;
         }
-        self.remove_entry(pubkey);
-        self.pending.insert(pubkey.to_owned(), url.to_owned());
+        self.remove_entry(key);
+        self.pending.insert(key.to_owned(), url.to_owned());
         true
     }
 
-    pub fn complete(&mut self, pubkey: String, url: String, image: Option<DynamicImage>) {
-        if self
-            .pending
-            .get(&pubkey)
-            .is_none_or(|pending| pending != &url)
-        {
+    pub fn complete(&mut self, key: String, url: String, image: Option<DynamicImage>) {
+        if self.pending.get(&key).is_none_or(|pending| pending != &url) {
             return;
         }
-        self.pending.remove(&pubkey);
+        self.pending.remove(&key);
 
         let protocol = image.and_then(|image| {
             self.picker
                 .as_ref()
                 .map(|picker| picker.new_resize_protocol(image))
         });
-        self.remove_entry(&pubkey);
+        self.remove_entry(&key);
         self.entries
-            .insert(pubkey.clone(), CacheEntry { url, protocol });
-        self.touch(&pubkey);
+            .insert(key.clone(), CacheEntry { url, protocol });
+        self.touch(&key);
         self.evict_to_limit();
     }
 
-    pub fn discard_completion(&mut self, pubkey: &str, url: &str) {
-        if self
-            .pending
-            .get(pubkey)
-            .is_some_and(|pending| pending == url)
-        {
-            self.pending.remove(pubkey);
-        }
-    }
-
-    pub fn profile_updated(&mut self, pubkey: &str, current_url: Option<&str>) {
+    pub fn source_updated(&mut self, key: &str, current_url: Option<&str>) {
         if self
             .entries
-            .get(pubkey)
+            .get(key)
             .is_some_and(|entry| Some(entry.url.as_str()) != current_url)
         {
-            self.remove_entry(pubkey);
+            self.remove_entry(key);
         }
     }
 
-    pub fn protocol_mut(&mut self, pubkey: &str, url: &str) -> Option<&mut StatefulProtocol> {
+    pub fn has_protocol(&self, key: &str, url: &str) -> bool {
+        self.entries
+            .get(key)
+            .is_some_and(|entry| entry.url == url && entry.protocol.is_some())
+    }
+
+    pub fn protocol_mut(&mut self, key: &str, url: &str) -> Option<&mut StatefulProtocol> {
         if !self
             .entries
-            .get(pubkey)
+            .get(key)
             .is_some_and(|entry| entry.url == url && entry.protocol.is_some())
         {
             return None;
         }
-        self.touch(pubkey);
+        self.touch(key);
         self.entries
-            .get_mut(pubkey)
+            .get_mut(key)
             .and_then(|entry| entry.protocol.as_mut())
     }
 
@@ -161,23 +173,35 @@ impl AvatarCache {
     }
 
     fn evict_to_limit(&mut self) {
-        while self.entries.len() > MAX_CACHED_AVATARS {
-            let Some(pubkey) = self.least_recently_used.pop_front() else {
+        while self.entries.len() > MAX_CACHED_IMAGES {
+            let Some(key) = self.least_recently_used.pop_front() else {
                 break;
             };
-            self.remove_entry(&pubkey);
+            self.remove_entry(&key);
         }
     }
 
-    fn remove_entry(&mut self, pubkey: &str) {
-        self.least_recently_used.retain(|key| key != pubkey);
-        let Some(entry) = self.entries.remove(pubkey) else {
+    fn remove_entry(&mut self, key: &str) {
+        self.least_recently_used.retain(|cached| cached != key);
+        let Some(entry) = self.entries.remove(key) else {
             return;
         };
         if let Some(id) = entry.protocol.as_ref().and_then(kitty_image_id) {
             self.deleted_ids.push(id);
         }
     }
+}
+
+fn kitty_terminal_from_env_values(
+    term: Option<&str>,
+    term_program: Option<&str>,
+    kitty_window_id: Option<&str>,
+) -> bool {
+    kitty_window_id.is_some_and(|value| !value.is_empty())
+        || term.is_some_and(|value| matches!(value, "xterm-kitty" | "xterm-ghostty"))
+        || term_program.is_some_and(|value| {
+            value.eq_ignore_ascii_case("kitty") || value.eq_ignore_ascii_case("ghostty")
+        })
 }
 
 fn kitty_image_id(protocol: &StatefulProtocol) -> Option<u32> {
@@ -210,21 +234,49 @@ pub fn delete_all_kitty_images(writer: &mut impl Write) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::{buffer::Buffer, layout::Rect, widgets::StatefulWidget};
+    use ratatui_image::StatefulImage;
+
     use super::*;
 
-    fn enabled_cache() -> AvatarCache {
-        let mut picker = Picker::from_fontsize((10, 20));
-        picker.set_protocol_type(ProtocolType::Kitty);
-        AvatarCache {
-            picker: Some(picker),
-            ..AvatarCache::default()
-        }
+    fn enabled_cache() -> ImageCache {
+        ImageCache::kitty_for_test()
     }
 
     #[test]
     fn disabled_cache_never_schedules_downloads() {
-        let mut cache = AvatarCache::default();
+        let mut cache = ImageCache::default();
         assert!(!cache.request("pubkey", "https://example.com/avatar.png"));
+    }
+
+    #[test]
+    fn enabled_cache_rejects_non_https_custom_emoji() {
+        let mut cache = enabled_cache();
+        assert!(!cache.request("emoji:party", "http://example.com/party.png"));
+    }
+
+    #[test]
+    fn kitty_environment_is_a_capability_detection_fallback() {
+        assert!(kitty_terminal_from_env_values(
+            Some("xterm-kitty"),
+            None,
+            None
+        ));
+        assert!(kitty_terminal_from_env_values(
+            Some("tmux-256color"),
+            None,
+            Some("1")
+        ));
+        assert!(kitty_terminal_from_env_values(
+            Some("dumb"),
+            Some("ghostty"),
+            None
+        ));
+        assert!(!kitty_terminal_from_env_values(
+            Some("xterm-256color"),
+            None,
+            None
+        ));
     }
 
     #[test]
@@ -239,27 +291,47 @@ mod tests {
     #[test]
     fn pending_downloads_are_bounded() {
         let mut cache = enabled_cache();
-        for index in 0..MAX_PENDING_AVATARS {
+        for index in 0..MAX_PENDING_IMAGES {
             assert!(cache.request(
                 &format!("pubkey-{index}"),
                 &format!("https://example.com/{index}.png")
             ));
         }
         assert!(!cache.request("one-too-many", "https://example.com/full.png"));
-        assert_eq!(cache.pending.len(), MAX_PENDING_AVATARS);
+        assert_eq!(cache.pending.len(), MAX_PENDING_IMAGES);
+    }
+
+    #[test]
+    fn completed_custom_emoji_is_ready_for_inline_rendering() {
+        let mut cache = enabled_cache();
+        let key = "emoji:https://example.com/party.png";
+        let url = "https://example.com/party.png";
+        assert!(cache.request(key, url));
+
+        cache.complete(
+            key.to_owned(),
+            url.to_owned(),
+            Some(DynamicImage::new_rgba8(16, 16)),
+        );
+
+        assert!(cache.has_protocol(key, url));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+        let protocol = cache.protocol_mut(key, url).unwrap();
+        StatefulImage::default().render(Rect::new(0, 0, 2, 1), &mut buffer, protocol);
+        assert!(buffer[(0, 0)].symbol().contains("\x1b_G"));
     }
 
     #[test]
     fn decoded_cache_evicts_and_releases_kitty_ids() {
         let mut cache = enabled_cache();
-        for index in 0..MAX_CACHED_AVATARS + 3 {
+        for index in 0..MAX_CACHED_IMAGES + 3 {
             let pubkey = format!("pubkey-{index}");
             let url = format!("https://example.com/{index}.png");
             assert!(cache.request(&pubkey, &url));
             cache.complete(pubkey, url, Some(DynamicImage::new_rgba8(16, 16)));
         }
 
-        assert_eq!(cache.entries.len(), MAX_CACHED_AVATARS);
+        assert_eq!(cache.entries.len(), MAX_CACHED_IMAGES);
         assert_eq!(cache.deleted_ids.len(), 3);
     }
 }

@@ -56,11 +56,11 @@ async fn main() -> Result<()> {
 
     let mut terminal = setup_terminal()?;
     let mut app = App::new(read_only, relays);
-    app.set_avatar_cache(graphics::AvatarCache::detect().unwrap_or_default());
+    app.set_image_cache(graphics::ImageCache::detect().unwrap_or_default());
     let result = run_app(&mut terminal, &mut app, command_tx, &mut ui_rx).await;
 
-    app.clear_avatars();
-    let image_cleanup = flush_deleted_avatars(&mut terminal, &mut app);
+    app.clear_images();
+    let image_cleanup = flush_deleted_images(&mut terminal, &mut app);
     let terminal_cleanup = restore_terminal(&mut terminal);
     network_task.abort();
     result?;
@@ -87,7 +87,7 @@ async fn run_app(
         for command in app
             .reference_commands()
             .into_iter()
-            .chain(app.avatar_commands())
+            .chain(app.image_commands())
         {
             command_tx
                 .send(command)
@@ -95,7 +95,7 @@ async fn run_app(
                 .context("network task stopped")?;
         }
 
-        flush_deleted_avatars(terminal, app)?;
+        flush_deleted_images(terminal, app)?;
 
         terminal.draw(|frame| ui::draw(frame, app))?;
 
@@ -115,11 +115,11 @@ async fn run_app(
     }
 }
 
-fn flush_deleted_avatars(
+fn flush_deleted_images(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> io::Result<()> {
-    let ids = app.take_deleted_avatar_ids();
+    let ids = app.take_deleted_image_ids();
     graphics::delete_kitty_images(terminal.backend_mut(), &ids)
 }
 

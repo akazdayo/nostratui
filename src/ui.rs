@@ -12,7 +12,7 @@ use ratatui_image::{FilterType, Resize, StatefulImage};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, InputMode, QuoteDisplay, RenderedPart, TimelineTab};
+use crate::app::{App, CustomEmoji, InputMode, QuoteDisplay, RenderedPart, TimelineTab};
 
 const ACCENT: Color = Color::Rgb(180, 140, 255);
 const DIM: Color = Color::Rgb(130, 135, 150);
@@ -114,6 +114,11 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut items = Vec::with_capacity(app.timeline().len());
     let mut item_heights = Vec::with_capacity(app.timeline().len());
     let mut authors = Vec::with_capacity(app.timeline().len());
+    let mut item_emojis = Vec::with_capacity(app.timeline().len());
+    let content_width = area
+        .width
+        .saturating_sub(2 + 2 + AVATAR_INDENT.width() as u16)
+        .min(180);
     for event in app.timeline() {
         let display = app.display_event(event);
         let author = app.author_name(&display.event.pubkey);
@@ -126,10 +131,12 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
             .as_ref()
             .map(|key| format!("↻ {}  ", app.author_name(key)))
             .unwrap_or_default();
-        let reactions = app.reaction_summary(&display.event);
+        let reactions =
+            compact_content_line(app, &app.rendered_reactions(&display.event), content_width);
         let rendered = app.rendered_content(&display.event);
+        let content = compact_content_line(app, &rendered.parts, content_width);
         let mut body = vec![Span::raw(AVATAR_INDENT)];
-        body.extend(compact_content_spans(&rendered.parts, 180));
+        body.extend(content.spans);
         let mut lines = vec![
             Line::from(vec![
                 Span::raw(AVATAR_INDENT),
@@ -147,15 +154,30 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         if let Some(quote) = rendered.quote.as_ref() {
             lines.extend(quote_lines(app, quote, AVATAR_INDENT));
         }
-        lines.extend([
-            Line::from(vec![
-                Span::raw(AVATAR_INDENT),
-                Span::styled(reactions, Style::default().fg(Color::Magenta)),
-            ]),
-            Line::raw(AVATAR_INDENT),
-        ]);
+        let reaction_row = lines.len() as u16;
+        let mut reaction_spans = vec![Span::raw(AVATAR_INDENT)];
+        reaction_spans.extend(reactions.spans.into_iter().map(|mut span| {
+            span.style = span.style.fg(Color::Magenta);
+            span
+        }));
+        lines.extend([Line::from(reaction_spans), Line::raw(AVATAR_INDENT)]);
         item_heights.push(lines.len() as u16);
         authors.push(display.event.pubkey);
+        let mut emojis = content
+            .images
+            .into_iter()
+            .map(|mut image| {
+                image.row = 1;
+                image.column += AVATAR_INDENT.width() as u16;
+                image
+            })
+            .collect::<Vec<_>>();
+        emojis.extend(reactions.images.into_iter().map(|mut image| {
+            image.row = reaction_row;
+            image.column += AVATAR_INDENT.width() as u16;
+            image
+        }));
+        item_emojis.push(emojis);
         items.push(ListItem::new(Text::from(lines)));
     }
 
@@ -194,12 +216,18 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let first = state.offset();
     let mut y = inner.y;
-    for (pubkey, height) in authors.iter().zip(item_heights.iter()).skip(first) {
+    for ((pubkey, height), emojis) in authors
+        .iter()
+        .zip(item_heights.iter())
+        .zip(item_emojis.iter())
+        .skip(first)
+    {
         if y.saturating_add(*height) > inner.bottom() {
             break;
         }
         let avatar_area = Rect::new(inner.x + 2, y, AVATAR_WIDTH, AVATAR_HEIGHT);
         render_avatar(frame, app, pubkey, avatar_area);
+        render_custom_emojis(frame, app, emojis, (inner.x + 2, y), inner);
         y = y.saturating_add(*height);
     }
 }
@@ -255,6 +283,68 @@ fn quote_lines(app: &App, quote: &QuoteDisplay, indent: &str) -> Vec<Line<'stati
     }
 }
 
+#[derive(Debug, Clone)]
+struct InlineImage {
+    row: u16,
+    column: u16,
+    emoji: CustomEmoji,
+}
+
+struct InlineLine {
+    spans: Vec<Span<'static>>,
+    images: Vec<InlineImage>,
+}
+
+struct InlineLayout {
+    lines: Vec<Line<'static>>,
+    images: Vec<InlineImage>,
+}
+
+fn compact_content_line(app: &App, parts: &[RenderedPart], width: u16) -> InlineLine {
+    let mut spans = Vec::new();
+    let mut images = Vec::new();
+    let mut column = 0_u16;
+    let mut truncated = false;
+
+    'parts: for part in parts {
+        if let Some(emoji) = part
+            .emoji
+            .as_ref()
+            .filter(|emoji| app.custom_emoji_ready(emoji))
+        {
+            if column.saturating_add(2) > width {
+                truncated = true;
+                break;
+            }
+            spans.push(Span::raw("  "));
+            images.push(InlineImage {
+                row: 0,
+                column,
+                emoji: emoji.clone(),
+            });
+            column += 2;
+            continue;
+        }
+
+        let text = part.text.replace('\n', " ↵ ");
+        for grapheme in text.graphemes(true) {
+            let grapheme_width = grapheme.width().min(u16::MAX as usize) as u16;
+            if column.saturating_add(grapheme_width) > width {
+                truncated = true;
+                break 'parts;
+            }
+            spans.push(content_span(grapheme.to_owned(), part.mention));
+            column = column.saturating_add(grapheme_width);
+        }
+    }
+    if truncated && column < width {
+        spans.push(Span::raw("…"));
+    }
+    InlineLine { spans, images }
+}
+
+// Quotes keep their shortcode fallback because their compact border layout is
+// not currently an inline-image surface.
 fn compact_content_spans(parts: &[RenderedPart], max_chars: usize) -> Vec<Span<'static>> {
     let transformed: Vec<_> = parts
         .iter()
@@ -266,7 +356,6 @@ fn compact_content_spans(parts: &[RenderedPart], max_chars: usize) -> Vec<Span<'
         .sum::<usize>();
     let mut remaining = max_chars;
     let mut spans = Vec::new();
-
     for (text, mention) in transformed {
         if remaining == 0 {
             break;
@@ -283,22 +372,62 @@ fn compact_content_spans(parts: &[RenderedPart], max_chars: usize) -> Vec<Span<'
     spans
 }
 
-fn detailed_content_lines(parts: &[RenderedPart]) -> Vec<Line<'static>> {
+fn detailed_content_layout(app: &App, parts: &[RenderedPart], width: u16) -> InlineLayout {
+    let width = width.max(1);
     let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut images = Vec::new();
+    let mut row = 0_u16;
+    let mut column = 0_u16;
+
     for part in parts {
-        for (index, text) in part.text.split('\n').enumerate() {
-            if index > 0 {
+        if let Some(emoji) = part
+            .emoji
+            .as_ref()
+            .filter(|emoji| app.custom_emoji_ready(emoji))
+        {
+            if column > 0 && column.saturating_add(2) > width {
                 lines.push(Vec::new());
+                row = row.saturating_add(1);
+                column = 0;
             }
-            if !text.is_empty() {
-                lines
-                    .last_mut()
-                    .expect("content always has a line")
-                    .push(content_span(text.to_owned(), part.mention));
+            lines
+                .last_mut()
+                .expect("content always has a line")
+                .push(Span::raw("  "));
+            images.push(InlineImage {
+                row,
+                column,
+                emoji: emoji.clone(),
+            });
+            column = column.saturating_add(2);
+            continue;
+        }
+
+        for grapheme in part.text.graphemes(true) {
+            if grapheme == "\n" {
+                lines.push(Vec::new());
+                row = row.saturating_add(1);
+                column = 0;
+                continue;
             }
+            let grapheme_width = grapheme.width().min(u16::MAX as usize) as u16;
+            if grapheme_width > 0 && column > 0 && column.saturating_add(grapheme_width) > width {
+                lines.push(Vec::new());
+                row = row.saturating_add(1);
+                column = 0;
+            }
+            lines
+                .last_mut()
+                .expect("content always has a line")
+                .push(content_span(grapheme.to_owned(), part.mention));
+            column = column.saturating_add(grapheme_width);
         }
     }
-    lines.into_iter().map(Line::from).collect()
+
+    InlineLayout {
+        lines: lines.into_iter().map(Line::from).collect(),
+        images,
+    }
 }
 
 fn content_span(text: String, mention: bool) -> Span<'static> {
@@ -346,7 +475,10 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
         header_lines.push(Line::styled(compact(&about, 100), Style::default().fg(DIM)));
     }
     let rendered = app.rendered_content(&display.event);
-    let mut body_lines = detailed_content_lines(&rendered.parts);
+    let content_layout =
+        detailed_content_layout(app, &rendered.parts, area.width.saturating_sub(2));
+    let mut body_lines = content_layout.lines;
+    let mut content_images = content_layout.images;
     if let Some(quote) = rendered.quote.as_ref() {
         body_lines.push(Line::raw(""));
         body_lines.extend(quote_lines(app, quote, ""));
@@ -358,11 +490,29 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
             format!("time  {}", format_time(display.event.created_at)),
             Style::default().fg(DIM),
         ),
-        Line::styled(
-            format!("reactions  {}", app.reaction_summary(&display.event)),
-            Style::default().fg(Color::Magenta),
-        ),
     ]);
+    let reaction_prefix = "reactions  ";
+    let reaction_row = body_lines.len() as u16;
+    let reactions = compact_content_line(
+        app,
+        &app.rendered_reactions(&display.event),
+        area.width
+            .saturating_sub(2 + reaction_prefix.width() as u16),
+    );
+    let mut reaction_spans = vec![Span::styled(
+        reaction_prefix,
+        Style::default().fg(Color::Magenta),
+    )];
+    reaction_spans.extend(reactions.spans.into_iter().map(|mut span| {
+        span.style = span.style.fg(Color::Magenta);
+        span
+    }));
+    body_lines.push(Line::from(reaction_spans));
+    content_images.extend(reactions.images.into_iter().map(|mut image| {
+        image.row = reaction_row;
+        image.column += reaction_prefix.width() as u16;
+        image
+    }));
     let block = Block::default()
         .title(" Detail · h to close ")
         .borders(Borders::ALL);
@@ -399,13 +549,22 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
             Paragraph::new(body_lines).wrap(Wrap { trim: false }),
             body_area,
         );
+        render_custom_emojis(
+            frame,
+            app,
+            &content_images,
+            (body_area.x, body_area.y),
+            body_area,
+        );
     } else {
+        let content_y = inner.y + header_lines.len() as u16 + 1;
         header_lines.push(Line::raw(""));
         header_lines.extend(body_lines);
         frame.render_widget(
             Paragraph::new(header_lines).wrap(Wrap { trim: false }),
             inner,
         );
+        render_custom_emojis(frame, app, &content_images, (inner.x, content_y), inner);
     }
 }
 
@@ -420,6 +579,31 @@ fn render_avatar(frame: &mut Frame, app: &mut App, pubkey: &PublicKey, area: Rec
     );
     // Consume encoding errors so stale results are not retained indefinitely.
     let _ = protocol.last_encoding_result();
+}
+
+fn render_custom_emojis(
+    frame: &mut Frame,
+    app: &mut App,
+    images: &[InlineImage],
+    origin: (u16, u16),
+    clip: Rect,
+) {
+    for image in images {
+        let x = origin.0.saturating_add(image.column);
+        let y = origin.1.saturating_add(image.row);
+        if x < clip.x || y < clip.y || x.saturating_add(2) > clip.right() || y >= clip.bottom() {
+            continue;
+        }
+        let Some(protocol) = app.custom_emoji_protocol_mut(&image.emoji) else {
+            continue;
+        };
+        frame.render_stateful_widget(
+            StatefulImage::default().resize(Resize::Fit(Some(FilterType::Triangle))),
+            Rect::new(x, y, 2, 1),
+            protocol,
+        );
+        let _ = protocol.last_encoding_result();
+    }
 }
 
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
