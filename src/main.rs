@@ -1,4 +1,5 @@
 mod app;
+mod graphics;
 mod network;
 mod ui;
 
@@ -24,7 +25,7 @@ struct Args {
         short,
         long = "relay",
         value_delimiter = ',',
-        default_value = "wss://relay.damus.io,wss://nos.lol"
+        default_value = "wss://yabu.me"
     )]
     relays: Vec<String>,
 
@@ -55,11 +56,16 @@ async fn main() -> Result<()> {
 
     let mut terminal = setup_terminal()?;
     let mut app = App::new(read_only, relays);
+    app.set_avatar_cache(graphics::AvatarCache::detect().unwrap_or_default());
     let result = run_app(&mut terminal, &mut app, command_tx, &mut ui_rx).await;
 
-    restore_terminal(&mut terminal)?;
+    app.clear_avatars();
+    let image_cleanup = flush_deleted_avatars(&mut terminal, &mut app);
+    let terminal_cleanup = restore_terminal(&mut terminal);
     network_task.abort();
-    result
+    result?;
+    image_cleanup?;
+    terminal_cleanup
 }
 
 async fn run_app(
@@ -78,6 +84,15 @@ async fn run_app(
             }
         }
 
+        for command in app.avatar_commands() {
+            command_tx
+                .send(command)
+                .await
+                .context("network task stopped")?;
+        }
+
+        flush_deleted_avatars(terminal, app)?;
+
         terminal.draw(|frame| ui::draw(frame, app))?;
 
         if event::poll(Duration::from_millis(50))? {
@@ -94,6 +109,14 @@ async fn run_app(
             }
         }
     }
+}
+
+fn flush_deleted_avatars(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> io::Result<()> {
+    let ids = app.take_deleted_avatar_ids();
+    graphics::delete_kitty_images(terminal.backend_mut(), &ids)
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
@@ -116,7 +139,9 @@ fn install_panic_hook() {
     let original = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let mut stdout = io::stdout();
+        let _ = graphics::delete_all_kitty_images(&mut stdout);
+        let _ = execute!(stdout, LeaveAlternateScreen);
         original(info);
     }));
 }

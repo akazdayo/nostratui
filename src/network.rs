@@ -1,5 +1,6 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, io::Cursor, time::Duration};
 
+use ::image::{imageops::FilterType, DynamicImage, ImageReader, Limits};
 use nostr_sdk::prelude::*;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
@@ -26,6 +27,11 @@ pub enum UiEvent {
         pubkey: String,
         address: String,
         verified: bool,
+    },
+    Avatar {
+        pubkey: String,
+        url: String,
+        image: Option<DynamicImage>,
     },
     Status(String),
 }
@@ -166,6 +172,17 @@ async fn handle_command(
             });
             return;
         }
+        Command::FetchAvatar { pubkey, url } => {
+            let pubkey = pubkey.clone();
+            let url = url.clone();
+            let http = http.clone();
+            let ui_tx = ui_tx.clone();
+            tokio::spawn(async move {
+                let image = fetch_avatar(&http, &url).await.ok();
+                let _ = ui_tx.send(UiEvent::Avatar { pubkey, url, image }).await;
+            });
+            return;
+        }
         Command::Quit => return,
         _ => {}
     }
@@ -191,7 +208,10 @@ async fn handle_command(
             .send_event_builder(EventBuilder::repost(&event, None))
             .await
             .map(|_| "reposted".to_owned()),
-        Command::VerifyNip05 { .. } | Command::FetchProfile(_) | Command::Quit => unreachable!(),
+        Command::VerifyNip05 { .. }
+        | Command::FetchProfile(_)
+        | Command::FetchAvatar { .. }
+        | Command::Quit => unreachable!(),
     };
 
     let status = match result {
@@ -199,6 +219,59 @@ async fn handle_command(
         Err(error) => format!("send failed: {error}"),
     };
     let _ = ui_tx.send(UiEvent::Status(status)).await;
+}
+
+const MAX_AVATAR_DOWNLOAD_BYTES: usize = 2 * 1024 * 1024;
+const MAX_AVATAR_DIMENSION: u32 = 2_048;
+const MAX_AVATAR_DECODE_ALLOC: u64 = 32 * 1024 * 1024;
+const CACHED_AVATAR_SIZE: u32 = 128;
+
+async fn fetch_avatar(http: &HttpClient, url: &str) -> anyhow::Result<DynamicImage> {
+    let mut response = http.get(url).send().await?.error_for_status()?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_AVATAR_DOWNLOAD_BYTES as u64)
+    {
+        anyhow::bail!("avatar response exceeds download limit");
+    }
+
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(MAX_AVATAR_DOWNLOAD_BYTES);
+    let mut bytes = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_AVATAR_DOWNLOAD_BYTES {
+            anyhow::bail!("avatar response exceeds download limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() {
+        anyhow::bail!("empty avatar response");
+    }
+
+    tokio::task::spawn_blocking(move || decode_avatar(bytes))
+        .await
+        .map_err(|error| anyhow::anyhow!("avatar decoder task failed: {error}"))?
+}
+
+fn decode_avatar(bytes: Vec<u8>) -> anyhow::Result<DynamicImage> {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_AVATAR_DIMENSION);
+    limits.max_image_height = Some(MAX_AVATAR_DIMENSION);
+    limits.max_alloc = Some(MAX_AVATAR_DECODE_ALLOC);
+
+    let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+    reader.limits(limits);
+    let image = reader.decode()?;
+    // Retain only a small, normalized RGBA image. The full decoded source is
+    // dropped before the event crosses into the UI task.
+    Ok(DynamicImage::ImageRgba8(
+        image
+            .resize(CACHED_AVATAR_SIZE, CACHED_AVATAR_SIZE, FilterType::Triangle)
+            .to_rgba8(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,9 +368,12 @@ fn nip08_mentions(content: &str) -> (String, Vec<Tag>) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use ::image::{DynamicImage, ImageFormat};
     use nostr_sdk::prelude::*;
 
-    use super::{nip08_mentions, short_id};
+    use super::{decode_avatar, nip08_mentions, short_id, CACHED_AVATAR_SIZE};
 
     #[test]
     fn short_ids_are_safe() {
@@ -319,5 +395,27 @@ mod tests {
         let (content, tags) = nip08_mentions("hello @npub1invalid");
         assert_eq!(content, "hello @npub1invalid");
         assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn avatar_decoder_normalizes_retained_size() {
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::new_rgba8(512, 256)
+            .write_to(&mut encoded, ImageFormat::Png)
+            .unwrap();
+
+        let decoded = decode_avatar(encoded.into_inner()).unwrap();
+        assert!(decoded.width() <= CACHED_AVATAR_SIZE);
+        assert!(decoded.height() <= CACHED_AVATAR_SIZE);
+    }
+
+    #[test]
+    fn avatar_decoder_rejects_excessive_dimensions() {
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::new_rgba8(2_049, 1)
+            .write_to(&mut encoded, ImageFormat::Png)
+            .unwrap();
+
+        assert!(decode_avatar(encoded.into_inner()).is_err());
     }
 }

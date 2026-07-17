@@ -10,6 +10,7 @@
 - NIP-19: `npub` / `note` のBech32表示
 - NIP-08: 従来の `#[index]` メンション送受信（入力時は `@npub...` / `nostr:note...`）
 - NIP-18: リポストの送受信
+- Kitty Graphics Protocol: 対応端末でプロフィールのアイコン画像を表示
 
 ## 起動
 
@@ -49,6 +50,8 @@ cargo run -- --relay wss://relay.example.com --relay wss://relay2.example.com
 | `q` | 終了 |
 
 TLは通常LIVE状態で新着へ追従します。`j` / `k` / `G`で移動するか詳細を開くとPAUSEDになり、選択中の投稿を維持したまま新着を上へ蓄積します。`g`で先頭へ戻るとLIVEへ復帰します。
+
+Kitty Graphics Protocolを検出できた場合は、タイムラインと詳細欄にプロフィールの`picture`を表示します。画像取得はHTTPSのみに限定し、同時取得数、ダウンロード量、デコードサイズ、LRUキャッシュ件数に上限を設けています。非対応端末では従来どおりテキスト表示になります。
 
 > [!IMPORTANT]
 > NIP-08は廃止済み仕様ですが、指定された既存イベントとの互換性のため対応しています。投稿時の `@npub...` / `nostr:npub...` / `nostr:note...` は `#[index]` と対応タグへ変換されます。

@@ -8,11 +8,17 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
+use ratatui_image::{FilterType, Resize, StatefulImage};
 
 use crate::app::{App, InputMode};
 
 const ACCENT: Color = Color::Rgb(180, 140, 255);
 const DIM: Color = Color::Rgb(130, 135, 150);
+const AVATAR_WIDTH: u16 = 4;
+const AVATAR_HEIGHT: u16 = 2;
+const TIMELINE_ITEM_HEIGHT: u16 = 4;
+const DETAIL_HEADER_HEIGHT: u16 = 4;
+const AVATAR_INDENT: &str = "      ";
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let input_height = if matches!(app.mode, InputMode::Normal) {
@@ -91,6 +97,7 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
             let body = display.content_with_mentions().replace('\n', " ↵ ");
             ListItem::new(Text::from(vec![
                 Line::from(vec![
+                    Span::raw(AVATAR_INDENT),
                     Span::styled(repost, Style::default().fg(Color::Yellow)),
                     Span::styled(author, Style::default().fg(ACCENT).bold()),
                     Span::styled(nip05, Style::default().fg(Color::Green)),
@@ -100,23 +107,53 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
                         Style::default().fg(DIM),
                     ),
                 ]),
-                Line::from(Span::raw(compact(&body, 180))),
-                Line::from(Span::styled(reactions, Style::default().fg(Color::Magenta))),
-                Line::raw(""),
+                Line::from(vec![
+                    Span::raw(AVATAR_INDENT),
+                    Span::raw(compact(&body, 180)),
+                ]),
+                Line::from(vec![
+                    Span::raw(AVATAR_INDENT),
+                    Span::styled(reactions, Style::default().fg(Color::Magenta)),
+                ]),
+                Line::raw(AVATAR_INDENT),
             ]))
         })
         .collect();
 
+    let block = Block::default().title(" Timeline ").borders(Borders::ALL);
+    let inner = block.inner(area);
     let list = List::new(items)
-        .block(Block::default().title(" Timeline ").borders(Borders::ALL))
+        .block(block)
         .highlight_symbol("▌ ")
         .highlight_style(Style::default().bg(Color::Rgb(35, 30, 48)));
     let mut state =
         ListState::default().with_selected((!app.timeline.is_empty()).then_some(app.selected));
     frame.render_stateful_widget(list, area, &mut state);
+
+    if inner.width < AVATAR_WIDTH + 2 {
+        return;
+    }
+    let first = state.offset();
+    let visible = usize::from(inner.height / TIMELINE_ITEM_HEIGHT);
+    let authors: Vec<_> = app
+        .timeline
+        .iter()
+        .skip(first)
+        .take(visible)
+        .map(|event| app.display_event(event).event.pubkey)
+        .collect();
+    for (row, pubkey) in authors.iter().enumerate() {
+        let avatar_area = Rect::new(
+            inner.x + 2,
+            inner.y + row as u16 * TIMELINE_ITEM_HEIGHT,
+            AVATAR_WIDTH,
+            AVATAR_HEIGHT,
+        );
+        render_avatar(frame, app, pubkey, avatar_area);
+    }
 }
 
-fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some(event) = app.selected_event() else {
         frame.render_widget(
             Paragraph::new("No event selected")
@@ -126,6 +163,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let display = app.display_event(event);
+    let author_key = display.event.pubkey;
     let pubkey = display
         .event
         .pubkey
@@ -137,7 +175,8 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         .to_bech32()
         .unwrap_or_else(|_| display.event.id.to_string());
     let profile = app.profiles.get(&display.event.pubkey.to_hex());
-    let mut lines = vec![
+    let about = profile.and_then(|value| value.about.clone());
+    let mut header_lines = vec![
         Line::styled(
             app.author_name(&display.event.pubkey),
             Style::default().fg(ACCENT).bold(),
@@ -145,14 +184,12 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         Line::styled(pubkey, Style::default().fg(Color::Cyan)),
     ];
     if let Some(nip05) = app.nip05_label(&display.event.pubkey) {
-        lines.push(Line::styled(nip05, Style::default().fg(Color::Green)));
+        header_lines.push(Line::styled(nip05, Style::default().fg(Color::Green)));
     }
-    if let Some(about) = profile.and_then(|value| value.about.as_ref()) {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(about, Style::default().fg(DIM)));
+    if let Some(about) = about {
+        header_lines.push(Line::styled(compact(&about, 100), Style::default().fg(DIM)));
     }
-    lines.extend([
-        Line::raw(""),
+    let body_lines = vec![
         Line::raw(display.content_with_mentions()),
         Line::raw(""),
         Line::styled(format!("note  {note_id}"), Style::default().fg(Color::Cyan)),
@@ -164,17 +201,64 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             format!("reactions  {}", app.reaction_summary(&display.event)),
             Style::default().fg(Color::Magenta),
         ),
-    ]);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title(" Detail · h to close ")
-                    .borders(Borders::ALL),
-            )
-            .wrap(Wrap { trim: false }),
+    ];
+    let block = Block::default()
+        .title(" Detail · h to close ")
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.kitty_images_enabled()
+        && inner.width >= AVATAR_WIDTH + 10
+        && inner.height > DETAIL_HEADER_HEIGHT
+    {
+        let header_area = Rect::new(
+            inner.x + AVATAR_WIDTH + 2,
+            inner.y,
+            inner.width - AVATAR_WIDTH - 2,
+            DETAIL_HEADER_HEIGHT,
+        );
+        frame.render_widget(
+            Paragraph::new(header_lines).wrap(Wrap { trim: false }),
+            header_area,
+        );
+        render_avatar(
+            frame,
+            app,
+            &author_key,
+            Rect::new(inner.x, inner.y, AVATAR_WIDTH, AVATAR_HEIGHT),
+        );
+        let body_area = Rect::new(
+            inner.x,
+            inner.y + DETAIL_HEADER_HEIGHT,
+            inner.width,
+            inner.height - DETAIL_HEADER_HEIGHT,
+        );
+        frame.render_widget(
+            Paragraph::new(body_lines).wrap(Wrap { trim: false }),
+            body_area,
+        );
+    } else {
+        header_lines.push(Line::raw(""));
+        header_lines.extend(body_lines);
+        frame.render_widget(
+            Paragraph::new(header_lines).wrap(Wrap { trim: false }),
+            inner,
+        );
+    }
+}
+
+fn render_avatar(frame: &mut Frame, app: &mut App, pubkey: &PublicKey, area: Rect) {
+    let Some(protocol) = app.avatar_protocol_mut(pubkey) else {
+        return;
+    };
+    frame.render_stateful_widget(
+        StatefulImage::default().resize(Resize::Fit(Some(FilterType::Triangle))),
         area,
+        protocol,
     );
+    // Consume encoding errors so stale results are not retained indefinitely.
+    let _ = protocol.last_encoding_result();
 }
 
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
@@ -248,7 +332,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_settings(frame: &mut Frame, app: &App) {
     let screen = frame.area();
     let width = screen.width.saturating_sub(4).clamp(1, 72);
-    let desired_height = app.relays().len() as u16 + 9;
+    let desired_height = app.relays().len() as u16 + 10;
     let height = screen.height.saturating_sub(2).clamp(1, desired_height);
     let area = Rect::new(
         screen.x + screen.width.saturating_sub(width) / 2,
@@ -268,6 +352,17 @@ fn draw_settings(frame: &mut Frame, app: &App) {
             Span::styled(account_mode, Style::default().fg(ACCENT).bold()),
         ]),
         Line::styled(app.identity.as_str(), Style::default().fg(Color::Cyan)),
+        Line::from(vec![
+            Span::styled("Images   ", Style::default().fg(DIM)),
+            Span::styled(
+                if app.kitty_images_enabled() {
+                    "Kitty graphics"
+                } else {
+                    "disabled (terminal unsupported)"
+                },
+                Style::default().fg(ACCENT),
+            ),
+        ]),
         Line::raw(""),
         Line::styled("Relays", Style::default().fg(DIM).bold()),
     ];

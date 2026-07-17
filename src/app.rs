@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use nostr_sdk::prelude::*;
 use serde::Deserialize;
 
-use crate::network::UiEvent;
+use crate::{graphics::AvatarCache, network::UiEvent};
 
 #[derive(Debug)]
 pub enum Command {
@@ -25,6 +25,10 @@ pub enum Command {
         address: String,
     },
     FetchProfile(PublicKey),
+    FetchAvatar {
+        pubkey: String,
+        url: String,
+    },
     Quit,
 }
 
@@ -34,6 +38,7 @@ pub struct Profile {
     pub display_name: Option<String>,
     pub nip05: Option<String>,
     pub about: Option<String>,
+    pub picture: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -98,6 +103,7 @@ pub struct App {
     pending_nip05: HashSet<(String, String)>,
     pending_profiles: HashSet<String>,
     profile_timestamps: HashMap<String, Timestamp>,
+    avatars: AvatarCache,
 }
 
 impl App {
@@ -122,7 +128,12 @@ impl App {
             pending_nip05: HashSet::new(),
             pending_profiles: HashSet::new(),
             profile_timestamps: HashMap::new(),
+            avatars: AvatarCache::default(),
         }
+    }
+
+    pub fn set_avatar_cache(&mut self, avatars: AvatarCache) {
+        self.avatars = avatars;
     }
 
     pub fn on_ui_event(&mut self, message: UiEvent) -> Option<Command> {
@@ -153,6 +164,19 @@ impl App {
                 self.pending_nip05.remove(&key);
                 if verified {
                     self.verified_nip05.insert(key);
+                }
+                None
+            }
+            UiEvent::Avatar { pubkey, url, image } => {
+                let is_current = self
+                    .profiles
+                    .get(&pubkey)
+                    .and_then(|profile| profile.picture.as_deref())
+                    == Some(url.as_str());
+                if is_current {
+                    self.avatars.complete(pubkey, url, image);
+                } else {
+                    self.avatars.discard_completion(&pubkey, &url);
                 }
                 None
             }
@@ -246,6 +270,8 @@ impl App {
                 None
             }
         });
+        self.avatars
+            .profile_updated(&pubkey, profile.picture.as_deref());
         self.profiles.insert(pubkey, profile);
         verification
     }
@@ -443,6 +469,72 @@ impl App {
 
     pub fn relays(&self) -> &[String] {
         &self.relays
+    }
+
+    pub fn kitty_images_enabled(&self) -> bool {
+        self.avatars.is_enabled()
+    }
+
+    /// Schedules only authors near the current viewport. Both the number of
+    /// in-flight requests and the decoded image cache are bounded by
+    /// `AvatarCache`.
+    pub fn avatar_commands(&mut self) -> Vec<Command> {
+        if !self.avatars.is_enabled() || self.timeline.is_empty() {
+            return Vec::new();
+        }
+
+        const VIEWPORT_RADIUS: usize = 12;
+        let start = self.selected.saturating_sub(VIEWPORT_RADIUS);
+        let end = (self.selected + VIEWPORT_RADIUS + 1).min(self.timeline.len());
+        let mut candidates = Vec::new();
+        let mut unique = HashSet::new();
+        for event in &self.timeline[start..end] {
+            let pubkey = if event.kind == Kind::Repost {
+                Event::from_json(&event.content)
+                    .ok()
+                    .map(|original| original.pubkey)
+                    .unwrap_or(event.pubkey)
+            } else {
+                event.pubkey
+            };
+            let key = pubkey.to_hex();
+            if !unique.insert(key.clone()) {
+                continue;
+            }
+            if let Some(url) = self
+                .profiles
+                .get(&key)
+                .and_then(|profile| profile.picture.clone())
+            {
+                candidates.push((key, url));
+            }
+        }
+
+        candidates
+            .into_iter()
+            .filter_map(|(pubkey, url)| {
+                self.avatars
+                    .request(&pubkey, &url)
+                    .then_some(Command::FetchAvatar { pubkey, url })
+            })
+            .collect()
+    }
+
+    pub fn avatar_protocol_mut(
+        &mut self,
+        pubkey: &PublicKey,
+    ) -> Option<&mut ratatui_image::protocol::StatefulProtocol> {
+        let key = pubkey.to_hex();
+        let url = self.profiles.get(&key)?.picture.clone()?;
+        self.avatars.protocol_mut(&key, &url)
+    }
+
+    pub fn take_deleted_avatar_ids(&mut self) -> Vec<u32> {
+        self.avatars.take_deleted_ids()
+    }
+
+    pub fn clear_avatars(&mut self) {
+        self.avatars.clear();
     }
 
     pub fn selected_event(&self) -> Option<&Event> {
