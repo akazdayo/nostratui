@@ -346,7 +346,6 @@ impl App {
                 None
             }
             (KeyCode::Char('l') | KeyCode::Enter, _) => {
-                self.pause_timeline();
                 self.detail = true;
                 None
             }
@@ -483,7 +482,7 @@ impl App {
 
     pub fn sync_timeline_viewport(&mut self, offset: usize) {
         self.timeline_offset = offset;
-        if offset == 0 && !self.detail {
+        if offset == 0 {
             self.resume_timeline();
         } else {
             self.live = false;
@@ -1072,6 +1071,23 @@ mod tests {
         app.sync_timeline_viewport(0);
         assert!(app.is_live());
         assert_eq!(app.unseen_count(), 0);
+    }
+
+    #[test]
+    fn detail_view_uses_the_same_timeline_mode_rules() {
+        let event = EventBuilder::text_note("selected")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let mut app = App::new(true, Vec::new());
+        app.add_event(event);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        app.sync_timeline_viewport(0);
+        assert!(app.detail);
+        assert!(app.is_live());
+
+        app.sync_timeline_viewport(1);
+        assert!(!app.is_live());
     }
 
     #[test]
