@@ -25,6 +25,7 @@ pub enum Command {
         address: String,
     },
     FetchProfile(PublicKey),
+    FetchEvent(EventId),
     FetchAvatar {
         pubkey: String,
         url: String,
@@ -103,6 +104,9 @@ pub struct App {
     seen: HashSet<String>,
     pending_nip05: HashSet<(String, String)>,
     pending_profiles: HashSet<String>,
+    referenced_events: HashMap<EventId, Event>,
+    requested_references: HashSet<EventId>,
+    pending_references: HashSet<EventId>,
     profile_timestamps: HashMap<String, Timestamp>,
     avatars: AvatarCache,
 }
@@ -129,6 +133,9 @@ impl App {
             seen: HashSet::new(),
             pending_nip05: HashSet::new(),
             pending_profiles: HashSet::new(),
+            referenced_events: HashMap::new(),
+            requested_references: HashSet::new(),
+            pending_references: HashSet::new(),
             profile_timestamps: HashMap::new(),
             avatars: AvatarCache::default(),
         }
@@ -148,6 +155,18 @@ impl App {
                 } else {
                     self.apply_profile(pubkey, &content)
                 }
+            }
+            UiEvent::ReferencedEvent { event_id, event } => {
+                self.pending_references.remove(&event_id);
+                if let Some(event) = event.filter(|event| event.id == event_id) {
+                    let pubkey = event.pubkey;
+                    self.referenced_events.insert(event_id, *event);
+                    let key = pubkey.to_hex();
+                    if !self.profiles.contains_key(&key) && self.pending_profiles.insert(key) {
+                        return Some(Command::FetchProfile(pubkey));
+                    }
+                }
+                None
             }
             UiEvent::Identity(identity) => {
                 self.identity = identity;
@@ -540,6 +559,63 @@ impl App {
             .collect()
     }
 
+    /// Fetches NIP-21 profiles and event references near the viewport without
+    /// adding referenced events to the main timeline.
+    pub fn reference_commands(&mut self) -> Vec<Command> {
+        const VIEWPORT_RADIUS: usize = 12;
+        const MAX_PENDING_REFERENCES: usize = 4;
+
+        let available = MAX_PENDING_REFERENCES.saturating_sub(self.pending_references.len());
+        if self.timeline.is_empty() {
+            return Vec::new();
+        }
+
+        let start = self.selected.saturating_sub(VIEWPORT_RADIUS);
+        let end = (self.selected + VIEWPORT_RADIUS + 1).min(self.timeline.len());
+        let mut ids = Vec::new();
+        let mut pubkeys = Vec::new();
+        let mut unique = HashSet::new();
+        let mut unique_pubkeys = HashSet::new();
+        for event in &self.timeline[start..end] {
+            let display = self.display_event(event);
+            let expanded = expand_mentions(&display.event.content, &display.event.tags);
+            for entity in content_entities(&expanded) {
+                match entity.kind {
+                    ContentEntityKind::Event(event_id) => {
+                        if unique.insert(event_id)
+                            && !self.referenced_events.contains_key(&event_id)
+                            && !self.timeline.iter().any(|event| event.id == event_id)
+                            && !self.requested_references.contains(&event_id)
+                        {
+                            ids.push(event_id);
+                        }
+                    }
+                    ContentEntityKind::Pubkey(pubkey) => {
+                        let key = pubkey.to_hex();
+                        if unique_pubkeys.insert(key.clone())
+                            && !self.profiles.contains_key(&key)
+                            && !self.pending_profiles.contains(&key)
+                        {
+                            pubkeys.push((key, pubkey));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut commands = Vec::new();
+        for (key, pubkey) in pubkeys {
+            self.pending_profiles.insert(key);
+            commands.push(Command::FetchProfile(pubkey));
+        }
+        commands.extend(ids.into_iter().take(available).map(|event_id| {
+            self.requested_references.insert(event_id);
+            self.pending_references.insert(event_id);
+            Command::FetchEvent(event_id)
+        }));
+        commands
+    }
+
     pub fn avatar_protocol_mut(
         &mut self,
         pubkey: &PublicKey,
@@ -576,6 +652,42 @@ impl App {
         }
     }
 
+    pub fn rendered_content(&self, event: &Event) -> RenderedContent {
+        let content = expand_mentions(&event.content, &event.tags);
+        let mut parts = Vec::new();
+        let mut cursor = 0;
+        let mut quote = None;
+
+        for entity in content_entities(&content) {
+            push_content_part(&mut parts, &content[cursor..entity.start], false);
+            match entity.kind {
+                ContentEntityKind::Pubkey(pubkey) => {
+                    push_content_part(&mut parts, &format!("@{}", self.author_name(&pubkey)), true);
+                }
+                ContentEntityKind::Event(event_id) if quote.is_none() => {
+                    quote = Some(QuoteDisplay {
+                        event_id,
+                        event: self
+                            .referenced_events
+                            .get(&event_id)
+                            .or_else(|| self.timeline.iter().find(|event| event.id == event_id))
+                            .cloned(),
+                        loading: self.pending_references.contains(&event_id)
+                            || !self.requested_references.contains(&event_id),
+                    });
+                }
+                ContentEntityKind::Event(_) => {
+                    push_content_part(&mut parts, &content[entity.start..entity.end], false);
+                }
+            }
+            cursor = entity.end;
+        }
+        push_content_part(&mut parts, &content[cursor..], false);
+        trim_content_parts(&mut parts);
+
+        RenderedContent { parts, quote }
+    }
+
     pub fn author_name(&self, pubkey: &PublicKey) -> String {
         let key = pubkey.to_hex();
         self.profiles
@@ -609,10 +721,52 @@ pub struct DisplayEvent {
     pub reposted_by: Option<PublicKey>,
 }
 
-impl DisplayEvent {
-    /// Expands the legacy NIP-08 `#[index]` notation using the indexed tag.
-    pub fn content_with_mentions(&self) -> String {
-        expand_mentions(&self.event.content, &self.event.tags)
+pub struct RenderedContent {
+    pub parts: Vec<RenderedPart>,
+    pub quote: Option<QuoteDisplay>,
+}
+
+pub struct RenderedPart {
+    pub text: String,
+    pub mention: bool,
+}
+
+pub struct QuoteDisplay {
+    pub event_id: EventId,
+    pub event: Option<Event>,
+    pub loading: bool,
+}
+
+fn push_content_part(parts: &mut Vec<RenderedPart>, text: &str, mention: bool) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = parts.last_mut().filter(|part| part.mention == mention) {
+        last.text.push_str(text);
+    } else {
+        parts.push(RenderedPart {
+            text: text.to_owned(),
+            mention,
+        });
+    }
+}
+
+fn trim_content_parts(parts: &mut Vec<RenderedPart>) {
+    while let Some(first) = parts.first_mut() {
+        first.text = first.text.trim_start().to_owned();
+        if first.text.is_empty() {
+            parts.remove(0);
+        } else {
+            break;
+        }
+    }
+    while let Some(last) = parts.last_mut() {
+        last.text = last.text.trim_end().to_owned();
+        if last.text.is_empty() {
+            parts.pop();
+        } else {
+            break;
+        }
     }
 }
 
@@ -658,6 +812,69 @@ pub fn expand_mentions(content: &str, tags: &Tags) -> String {
     output
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContentEntity {
+    start: usize,
+    end: usize,
+    kind: ContentEntityKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentEntityKind {
+    Pubkey(PublicKey),
+    Event(EventId),
+}
+
+fn content_entities(content: &str) -> Vec<ContentEntity> {
+    let mut entities = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < content.len() {
+        let nostr = content[cursor..].find("nostr:").map(|index| cursor + index);
+        let npub = content[cursor..].find("@npub1").map(|index| cursor + index);
+        let Some(start) = nostr.into_iter().chain(npub).min() else {
+            break;
+        };
+        let is_at_npub = content[start..].starts_with("@npub1");
+        let token_start = if is_at_npub { start + 1 } else { start };
+        let end = content[token_start..]
+            .char_indices()
+            .take_while(|(_, character)| {
+                character.is_ascii_lowercase()
+                    || character.is_ascii_digit()
+                    || (!is_at_npub && *character == ':')
+            })
+            .last()
+            .map(|(index, character)| token_start + index + character.len_utf8())
+            .unwrap_or(token_start);
+
+        let kind = if is_at_npub {
+            PublicKey::parse(&content[token_start..end])
+                .ok()
+                .map(ContentEntityKind::Pubkey)
+        } else {
+            Nip21::parse(&content[start..end])
+                .ok()
+                .and_then(|entity| match entity {
+                    Nip21::Pubkey(pubkey) => Some(ContentEntityKind::Pubkey(pubkey)),
+                    Nip21::Profile(profile) => Some(ContentEntityKind::Pubkey(profile.public_key)),
+                    Nip21::EventId(event_id) => Some(ContentEntityKind::Event(event_id)),
+                    Nip21::Event(event) => Some(ContentEntityKind::Event(event.event_id)),
+                    Nip21::Coordinate(_) => None,
+                })
+        };
+
+        if let Some(kind) = kind {
+            entities.push(ContentEntity { start, end, kind });
+            cursor = end;
+        } else {
+            cursor = start + if is_at_npub { 1 } else { "nostr:".len() };
+        }
+    }
+
+    entities
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +893,105 @@ mod tests {
         let tags = Tags::new();
         assert_eq!(expand_mentions("hello #[9]", &tags), "hello #[9]");
         assert_eq!(expand_mentions("hello #[", &tags), "hello #[");
+    }
+
+    #[test]
+    fn renders_nip21_profile_as_named_mention() {
+        let mentioned = Keys::generate().public_key();
+        let uri = Nip19Profile::new(mentioned, Vec::<RelayUrl>::new())
+            .to_nostr_uri()
+            .unwrap();
+        let event = EventBuilder::text_note(format!("hello {uri}!"))
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let mut app = App::new(true, Vec::new());
+        app.profiles.insert(
+            mentioned.to_hex(),
+            Profile {
+                display_name: Some("Alice".to_owned()),
+                ..Profile::default()
+            },
+        );
+
+        let rendered = app.rendered_content(&event);
+
+        assert_eq!(
+            rendered
+                .parts
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect::<String>(),
+            "hello @Alice!"
+        );
+        assert!(rendered
+            .parts
+            .iter()
+            .any(|part| part.mention && part.text == "@Alice"));
+        assert!(rendered.quote.is_none());
+    }
+
+    #[test]
+    fn parses_nevent_and_renders_fetched_quote() {
+        let quoted = EventBuilder::text_note("quoted body")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let uri = Nip19Event::from(&quoted).to_nostr_uri().unwrap();
+        let outer = EventBuilder::text_note(format!("my comment\n{uri}"))
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let mut app = App::new(true, Vec::new());
+
+        let pending = app.rendered_content(&outer);
+        assert_eq!(
+            pending
+                .parts
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect::<String>(),
+            "my comment"
+        );
+        assert_eq!(
+            pending.quote.as_ref().map(|quote| quote.event_id),
+            Some(quoted.id)
+        );
+        assert!(pending.quote.and_then(|quote| quote.event).is_none());
+
+        app.on_ui_event(UiEvent::ReferencedEvent {
+            event_id: quoted.id,
+            event: Some(Box::new(quoted.clone())),
+        });
+        let rendered = app.rendered_content(&outer);
+
+        assert_eq!(
+            rendered
+                .quote
+                .and_then(|quote| quote.event)
+                .map(|event| event.content),
+            Some("quoted body".to_owned())
+        );
+    }
+
+    #[test]
+    fn schedules_each_quoted_event_fetch_once() {
+        let quoted = EventBuilder::text_note("quoted body")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let uri = Nip19Event::from(&quoted).to_nostr_uri().unwrap();
+        let outer = EventBuilder::text_note(uri)
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let mut app = App::new(true, Vec::new());
+        app.on_ui_event(UiEvent::Event(Box::new(outer)));
+
+        let first = app.reference_commands();
+        let second = app.reference_commands();
+
+        assert!(first
+            .iter()
+            .any(|command| matches!(command, Command::FetchEvent(id) if *id == quoted.id)));
+        assert!(!second
+            .iter()
+            .any(|command| matches!(command, Command::FetchEvent(id) if *id == quoted.id)));
     }
 
     #[test]

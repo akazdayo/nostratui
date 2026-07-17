@@ -33,6 +33,10 @@ pub enum UiEvent {
         url: String,
         image: Option<DynamicImage>,
     },
+    ReferencedEvent {
+        event_id: EventId,
+        event: Option<Box<Event>>,
+    },
     Status(String),
 }
 
@@ -172,6 +176,23 @@ async fn handle_command(
             });
             return;
         }
+        Command::FetchEvent(event_id) => {
+            let event_id = *event_id;
+            let client = client.clone();
+            let ui_tx = ui_tx.clone();
+            tokio::spawn(async move {
+                let event = client
+                    .fetch_events(Filter::new().id(event_id), Duration::from_secs(5))
+                    .await
+                    .ok()
+                    .and_then(|events| events.into_iter().next())
+                    .map(Box::new);
+                let _ = ui_tx
+                    .send(UiEvent::ReferencedEvent { event_id, event })
+                    .await;
+            });
+            return;
+        }
         Command::FetchAvatar { pubkey, url } => {
             let pubkey = pubkey.clone();
             let url = url.clone();
@@ -220,6 +241,7 @@ async fn handle_command(
             .map(|_| "reposted".to_owned()),
         Command::VerifyNip05 { .. }
         | Command::FetchProfile(_)
+        | Command::FetchEvent(_)
         | Command::FetchAvatar { .. }
         | Command::Quit => unreachable!(),
     };

@@ -84,7 +84,11 @@ async fn run_app(
             }
         }
 
-        for command in app.avatar_commands() {
+        for command in app
+            .reference_commands()
+            .into_iter()
+            .chain(app.avatar_commands())
+        {
             command_tx
                 .send(command)
                 .await

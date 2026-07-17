@@ -12,13 +12,12 @@ use ratatui_image::{FilterType, Resize, StatefulImage};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, InputMode};
+use crate::app::{App, InputMode, QuoteDisplay, RenderedPart};
 
 const ACCENT: Color = Color::Rgb(180, 140, 255);
 const DIM: Color = Color::Rgb(130, 135, 150);
 const AVATAR_WIDTH: u16 = 4;
 const AVATAR_HEIGHT: u16 = 2;
-const TIMELINE_ITEM_HEIGHT: u16 = 4;
 const DETAIL_HEADER_HEIGHT: u16 = 4;
 const AVATAR_INDENT: &str = "      ";
 
@@ -80,47 +79,53 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
-    let items: Vec<ListItem> = app
-        .timeline
-        .iter()
-        .map(|event| {
-            let display = app.display_event(event);
-            let author = app.author_name(&display.event.pubkey);
-            let nip05 = app
-                .nip05_label(&display.event.pubkey)
-                .map(|value| format!("  {value}"))
-                .unwrap_or_default();
-            let repost = display
-                .reposted_by
-                .as_ref()
-                .map(|key| format!("↻ {}  ", app.author_name(key)))
-                .unwrap_or_default();
-            let reactions = app.reaction_summary(&display.event);
-            let body = display.content_with_mentions().replace('\n', " ↵ ");
-            ListItem::new(Text::from(vec![
-                Line::from(vec![
-                    Span::raw(AVATAR_INDENT),
-                    Span::styled(repost, Style::default().fg(Color::Yellow)),
-                    Span::styled(author, Style::default().fg(ACCENT).bold()),
-                    Span::styled(nip05, Style::default().fg(Color::Green)),
-                    Span::raw("  "),
-                    Span::styled(
-                        format_time(display.event.created_at),
-                        Style::default().fg(DIM),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::raw(AVATAR_INDENT),
-                    Span::raw(compact(&body, 180)),
-                ]),
-                Line::from(vec![
-                    Span::raw(AVATAR_INDENT),
-                    Span::styled(reactions, Style::default().fg(Color::Magenta)),
-                ]),
-                Line::raw(AVATAR_INDENT),
-            ]))
-        })
-        .collect();
+    let mut items = Vec::with_capacity(app.timeline.len());
+    let mut item_heights = Vec::with_capacity(app.timeline.len());
+    let mut authors = Vec::with_capacity(app.timeline.len());
+    for event in &app.timeline {
+        let display = app.display_event(event);
+        let author = app.author_name(&display.event.pubkey);
+        let nip05 = app
+            .nip05_label(&display.event.pubkey)
+            .map(|value| format!("  {value}"))
+            .unwrap_or_default();
+        let repost = display
+            .reposted_by
+            .as_ref()
+            .map(|key| format!("↻ {}  ", app.author_name(key)))
+            .unwrap_or_default();
+        let reactions = app.reaction_summary(&display.event);
+        let rendered = app.rendered_content(&display.event);
+        let mut body = vec![Span::raw(AVATAR_INDENT)];
+        body.extend(compact_content_spans(&rendered.parts, 180));
+        let mut lines = vec![
+            Line::from(vec![
+                Span::raw(AVATAR_INDENT),
+                Span::styled(repost, Style::default().fg(Color::Yellow)),
+                Span::styled(author, Style::default().fg(ACCENT).bold()),
+                Span::styled(nip05, Style::default().fg(Color::Green)),
+                Span::raw("  "),
+                Span::styled(
+                    format_time(display.event.created_at),
+                    Style::default().fg(DIM),
+                ),
+            ]),
+            Line::from(body),
+        ];
+        if let Some(quote) = rendered.quote.as_ref() {
+            lines.extend(quote_lines(app, quote, AVATAR_INDENT));
+        }
+        lines.extend([
+            Line::from(vec![
+                Span::raw(AVATAR_INDENT),
+                Span::styled(reactions, Style::default().fg(Color::Magenta)),
+            ]),
+            Line::raw(AVATAR_INDENT),
+        ]);
+        item_heights.push(lines.len() as u16);
+        authors.push(display.event.pubkey);
+        items.push(ListItem::new(Text::from(lines)));
+    }
 
     let block = Block::default().title(" Timeline ").borders(Borders::ALL);
     let inner = block.inner(area);
@@ -138,22 +143,119 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     let first = state.offset();
-    let visible = usize::from(inner.height / TIMELINE_ITEM_HEIGHT);
-    let authors: Vec<_> = app
-        .timeline
-        .iter()
-        .skip(first)
-        .take(visible)
-        .map(|event| app.display_event(event).event.pubkey)
-        .collect();
-    for (row, pubkey) in authors.iter().enumerate() {
-        let avatar_area = Rect::new(
-            inner.x + 2,
-            inner.y + row as u16 * TIMELINE_ITEM_HEIGHT,
-            AVATAR_WIDTH,
-            AVATAR_HEIGHT,
-        );
+    let mut y = inner.y;
+    for (pubkey, height) in authors.iter().zip(item_heights.iter()).skip(first) {
+        if y.saturating_add(*height) > inner.bottom() {
+            break;
+        }
+        let avatar_area = Rect::new(inner.x + 2, y, AVATAR_WIDTH, AVATAR_HEIGHT);
         render_avatar(frame, app, pubkey, avatar_area);
+        y = y.saturating_add(*height);
+    }
+}
+
+fn quote_lines(app: &App, quote: &QuoteDisplay, indent: &str) -> Vec<Line<'static>> {
+    match quote.event.as_ref() {
+        Some(event) => {
+            let author = app.author_name(&event.pubkey);
+            let rendered = app.rendered_content(event);
+            let mut body = vec![
+                Span::raw(indent.to_owned()),
+                Span::styled("│ ", Style::default().fg(Color::Cyan)),
+            ];
+            body.extend(compact_content_spans(&rendered.parts, 160));
+            vec![
+                Line::from(vec![
+                    Span::raw(indent.to_owned()),
+                    Span::styled("┌ ↳ ", Style::default().fg(Color::Cyan)),
+                    Span::styled(author, Style::default().fg(ACCENT).bold()),
+                    Span::raw("  "),
+                    Span::styled(format_time(event.created_at), Style::default().fg(DIM)),
+                ]),
+                Line::from(body),
+            ]
+        }
+        None => {
+            let id = quote
+                .event_id
+                .to_bech32()
+                .unwrap_or_else(|_| quote.event_id.to_string());
+            vec![
+                Line::from(vec![
+                    Span::raw(indent.to_owned()),
+                    Span::styled("┌ ↳ quoted note", Style::default().fg(Color::Cyan)),
+                ]),
+                Line::from(vec![
+                    Span::raw(indent.to_owned()),
+                    Span::styled(
+                        format!(
+                            "│ {} · {}",
+                            compact(&id, 22),
+                            if quote.loading {
+                                "loading…"
+                            } else {
+                                "unavailable"
+                            }
+                        ),
+                        Style::default().fg(DIM),
+                    ),
+                ]),
+            ]
+        }
+    }
+}
+
+fn compact_content_spans(parts: &[RenderedPart], max_chars: usize) -> Vec<Span<'static>> {
+    let transformed: Vec<_> = parts
+        .iter()
+        .map(|part| (part.text.replace('\n', " ↵ "), part.mention))
+        .collect();
+    let total_chars = transformed
+        .iter()
+        .map(|(text, _)| text.chars().count())
+        .sum::<usize>();
+    let mut remaining = max_chars;
+    let mut spans = Vec::new();
+
+    for (text, mention) in transformed {
+        if remaining == 0 {
+            break;
+        }
+        let compact: String = text.chars().take(remaining).collect();
+        remaining = remaining.saturating_sub(compact.chars().count());
+        if !compact.is_empty() {
+            spans.push(content_span(compact, mention));
+        }
+    }
+    if total_chars > max_chars {
+        spans.push(Span::raw("…"));
+    }
+    spans
+}
+
+fn detailed_content_lines(parts: &[RenderedPart]) -> Vec<Line<'static>> {
+    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    for part in parts {
+        for (index, text) in part.text.split('\n').enumerate() {
+            if index > 0 {
+                lines.push(Vec::new());
+            }
+            if !text.is_empty() {
+                lines
+                    .last_mut()
+                    .expect("content always has a line")
+                    .push(content_span(text.to_owned(), part.mention));
+            }
+        }
+    }
+    lines.into_iter().map(Line::from).collect()
+}
+
+fn content_span(text: String, mention: bool) -> Span<'static> {
+    if mention {
+        Span::styled(text, Style::default().fg(Color::Cyan).bold())
+    } else {
+        Span::raw(text)
     }
 }
 
@@ -193,8 +295,13 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     if let Some(about) = about {
         header_lines.push(Line::styled(compact(&about, 100), Style::default().fg(DIM)));
     }
-    let body_lines = vec![
-        Line::raw(display.content_with_mentions()),
+    let rendered = app.rendered_content(&display.event);
+    let mut body_lines = detailed_content_lines(&rendered.parts);
+    if let Some(quote) = rendered.quote.as_ref() {
+        body_lines.push(Line::raw(""));
+        body_lines.extend(quote_lines(app, quote, ""));
+    }
+    body_lines.extend([
         Line::raw(""),
         Line::styled(format!("note  {note_id}"), Style::default().fg(Color::Cyan)),
         Line::styled(
@@ -205,7 +312,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
             format!("reactions  {}", app.reaction_summary(&display.event)),
             Style::default().fg(Color::Magenta),
         ),
-    ];
+    ]);
     let block = Block::default()
         .title(" Detail · h to close ")
         .borders(Borders::ALL);
@@ -468,16 +575,30 @@ fn compact(value: &str, max_chars: usize) -> String {
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use nostr_sdk::prelude::*;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{
+        backend::TestBackend,
+        style::{Color, Modifier},
+        Terminal,
+    };
 
     use crate::{app::App, network::UiEvent};
 
-    use super::{compact, draw, editor_layout, EditorLayout};
+    use super::{compact, content_span, draw, editor_layout, EditorLayout};
 
     #[test]
     fn compact_handles_unicode() {
         assert_eq!(compact("こんにちは", 3), "こんに…");
         assert_eq!(compact("abc", 3), "abc");
+    }
+
+    #[test]
+    fn mention_span_has_distinct_style() {
+        let mention = content_span("@Alice".to_owned(), true);
+        let body = content_span("hello".to_owned(), false);
+
+        assert_eq!(mention.style.fg, Some(Color::Cyan));
+        assert!(mention.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(body.style.fg, None);
     }
 
     #[test]
