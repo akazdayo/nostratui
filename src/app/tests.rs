@@ -3,6 +3,34 @@ use super::*;
 mod content;
 
 #[test]
+fn minus_key_does_not_send_a_reaction() {
+    let event = EventBuilder::text_note("target")
+        .sign_with_keys(&Keys::generate())
+        .unwrap();
+    let mut app = App::new(false, Vec::new());
+    app.select_tab(TimelineTab::Global);
+    app.add_event(event);
+
+    let command = app.on_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
+
+    assert!(command.is_none());
+}
+
+#[test]
+fn plus_key_does_not_send_a_reaction() {
+    let event = EventBuilder::text_note("target")
+        .sign_with_keys(&Keys::generate())
+        .unwrap();
+    let mut app = App::new(false, Vec::new());
+    app.select_tab(TimelineTab::Global);
+    app.add_event(event);
+
+    let command = app.on_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+
+    assert!(command.is_none());
+}
+
+#[test]
 fn compose_cursor_moves_and_edits_at_grapheme_boundaries() {
     let mut app = App::new(false, Vec::new());
     let press = |app: &mut App, code| {

@@ -95,7 +95,7 @@ impl App {
                 }
                 None
             }
-            (KeyCode::Char('+'), _) => {
+            (KeyCode::Char('f'), _) => {
                 if self.read_only {
                     self.status = "read-only: set NOSTR_SECRET_KEY to react".to_owned();
                     return None;
@@ -103,16 +103,6 @@ impl App {
                 self.selected_content_event().map(|event| Command::React {
                     event: Box::new(event),
                     reaction: "+".to_owned(),
-                })
-            }
-            (KeyCode::Char('-'), _) => {
-                if self.read_only {
-                    self.status = "read-only: set NOSTR_SECRET_KEY to react".to_owned();
-                    return None;
-                }
-                self.selected_content_event().map(|event| Command::React {
-                    event: Box::new(event),
-                    reaction: "-".to_owned(),
                 })
             }
             (KeyCode::Char('e'), _) => {

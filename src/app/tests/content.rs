@@ -395,11 +395,11 @@ fn renders_generic_repost_and_targets_original_for_actions() {
     assert_eq!(display.reposted_by, Some(reposter.public_key()));
 
     let command = app
-        .on_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE))
+        .on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
         .unwrap();
     assert!(matches!(
         command,
-        Command::React { event, .. } if event.id == original.id
+        Command::React { event, reaction } if event.id == original.id && reaction == "+"
     ));
 }
 
@@ -410,6 +410,28 @@ fn reaction_summary_is_stable() {
     reactions.add("+");
     reactions.add("🔥");
     assert_eq!(reactions.summary(), "+1 🔥2");
+}
+
+#[test]
+fn locally_forwarded_reaction_is_rendered_once_after_a_relay_echo() {
+    let target = EventBuilder::text_note("target")
+        .sign_with_keys(&Keys::generate())
+        .unwrap();
+    let reaction = EventBuilder::reaction(&target, "+")
+        .sign_with_keys(&Keys::generate())
+        .unwrap();
+    let mut app = App::new(true, Vec::new());
+
+    app.on_ui_event(UiEvent::Event(Box::new(target.clone())));
+    app.on_ui_event(UiEvent::Event(Box::new(reaction.clone())));
+    app.on_ui_event(UiEvent::Event(Box::new(reaction)));
+
+    let rendered = app
+        .rendered_reactions(&target)
+        .into_iter()
+        .map(|part| part.text)
+        .collect::<String>();
+    assert_eq!(rendered, "+1");
 }
 
 #[test]

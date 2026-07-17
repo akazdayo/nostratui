@@ -304,10 +304,22 @@ async fn handle_command(
                 Err(error) => Err(error),
             }
         }
-        Command::React { event, reaction } => client
-            .send_event_builder(EventBuilder::reaction(&*event, reaction))
-            .await
-            .map(|_| "reaction sent".to_owned()),
+        Command::React { event, reaction } => {
+            let builder = EventBuilder::reaction(&*event, reaction);
+            match client.sign_event_builder(builder).await {
+                Ok(reaction_event) => match client.send_event(&reaction_event).await {
+                    Ok(_) => {
+                        // Relays do not always echo our own event to the active
+                        // subscription, so update the local reaction aggregate from
+                        // the exact signed event that was accepted.
+                        let _ = ui_tx.send(UiEvent::Event(Box::new(reaction_event))).await;
+                        Ok("reaction sent".to_owned())
+                    }
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            }
+        }
         Command::Repost(event) => client
             .send_event_builder(EventBuilder::repost(&event, None))
             .await

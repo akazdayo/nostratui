@@ -67,7 +67,7 @@ pub(super) fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         " SETTINGS  m/Esc close  q quit ".to_owned()
     } else if matches!(app.mode, InputMode::Normal) {
         format!(
-            " {timeline_mode}  Tab/1/2 timeline  j/k move  g LIVE/top  G last  l/Enter detail  m settings  i/o post  r reply  +/-/e react  R repost  q quit "
+            " {timeline_mode}  Tab/1/2 timeline  j/k move  g LIVE/top  G last  l/Enter detail  m settings  i/o post  r reply  f/e react  R repost  q quit "
         )
     } else {
         format!(" {timeline_mode}  INSERT ")
