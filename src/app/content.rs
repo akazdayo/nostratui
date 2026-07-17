@@ -254,7 +254,10 @@ fn push_content_part(parts: &mut Vec<RenderedPart>, text: &str, mention: bool) {
     if text.is_empty() {
         return;
     }
-    if let Some(last) = parts.last_mut().filter(|part| part.mention == mention) {
+    if let Some(last) = parts
+        .last_mut()
+        .filter(|part| part.emoji.is_none() && part.mention == mention)
+    {
         last.text.push_str(text);
     } else {
         parts.push(RenderedPart {

@@ -458,13 +458,9 @@ fn custom_reaction_is_exposed_as_a_renderable_emoji() {
             .map(|emoji| emoji.shortcode.as_str()),
         Some("party")
     );
-    assert_eq!(
-        rendered
-            .iter()
-            .map(|part| part.text.as_str())
-            .collect::<String>(),
-        ":party:2"
-    );
+    assert_eq!(rendered.len(), 2);
+    assert_eq!(rendered[1].text, "2");
+    assert!(rendered[1].emoji.is_none());
 }
 
 #[test]
