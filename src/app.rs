@@ -758,6 +758,19 @@ impl App {
                     }
                 }
             }
+            if let Some(event_id) = reply_target_id(&display.event) {
+                if unique.insert(event_id)
+                    && !self.referenced_events.contains_key(&event_id)
+                    && !self
+                        .global_timeline
+                        .events
+                        .iter()
+                        .any(|event| event.id == event_id)
+                    && !self.requested_references.contains(&event_id)
+                {
+                    ids.push(event_id);
+                }
+            }
             let expanded = expand_mentions(&display.event.content, &display.event.tags);
             for entity in content_entities(&expanded) {
                 match entity.kind {
@@ -871,6 +884,25 @@ impl App {
         }
     }
 
+    pub fn reply_display(&self, event: &Event) -> Option<ReplyDisplay> {
+        let event_id = reply_target_id(event)?;
+        Some(ReplyDisplay {
+            event_id,
+            event: self
+                .referenced_events
+                .get(&event_id)
+                .or_else(|| {
+                    self.global_timeline
+                        .events
+                        .iter()
+                        .find(|event| event.id == event_id)
+                })
+                .cloned(),
+            loading: self.pending_references.contains(&event_id)
+                || !self.requested_references.contains(&event_id),
+        })
+    }
+
     pub fn rendered_content(&self, event: &Event) -> RenderedContent {
         let content = expand_mentions(&event.content, &event.tags);
         let mut parts = Vec::new();
@@ -977,6 +1009,12 @@ pub struct QuoteDisplay {
     pub loading: bool,
 }
 
+pub struct ReplyDisplay {
+    pub event_id: EventId,
+    pub event: Option<Event>,
+    pub loading: bool,
+}
+
 fn is_repost(event: &Event) -> bool {
     matches!(event.kind, Kind::Repost | Kind::GenericRepost)
 }
@@ -997,6 +1035,55 @@ fn embedded_repost(event: &Event) -> Option<Event> {
     repost_target_id(event)
         .is_none_or(|target| target == original.id)
         .then_some(original)
+}
+
+/// Finds the immediate parent of a NIP-10 reply. Marked tags take precedence;
+/// unmarked tags use the deprecated positional convention where the last `e`
+/// tag is the event being replied to.
+fn reply_target_id(event: &Event) -> Option<EventId> {
+    if event.kind != Kind::TextNote {
+        return None;
+    }
+
+    let mut reply = None;
+    let mut root = None;
+    let mut legacy = None;
+    let indexed_mentions = indexed_tag_references(&event.content);
+    for (index, tag) in event.tags.iter().enumerate() {
+        let Some(TagStandard::Event {
+            event_id, marker, ..
+        }) = tag.as_standardized()
+        else {
+            continue;
+        };
+        match marker {
+            Some(Marker::Reply) => reply.get_or_insert(*event_id),
+            Some(Marker::Root) => root.get_or_insert(*event_id),
+            None => {
+                if !indexed_mentions.contains(&index) {
+                    legacy = Some(*event_id);
+                }
+                continue;
+            }
+        };
+    }
+    reply.or(root).or(legacy)
+}
+
+fn indexed_tag_references(content: &str) -> HashSet<usize> {
+    let mut indices = HashSet::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("#[") {
+        let candidate = &rest[start + 2..];
+        let Some(end) = candidate.find(']') else {
+            break;
+        };
+        if let Ok(index) = candidate[..end].parse() {
+            indices.insert(index);
+        }
+        rest = &candidate[end + 1..];
+    }
+    indices
 }
 
 fn push_content_part(parts: &mut Vec<RenderedPart>, text: &str, mention: bool) {
@@ -1447,6 +1534,86 @@ mod tests {
         assert!(!second
             .iter()
             .any(|command| matches!(command, Command::FetchEvent(id) if *id == quoted.id)));
+    }
+
+    #[test]
+    fn fetches_and_exposes_the_parent_of_a_reply() {
+        let parent = EventBuilder::text_note("parent body")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let reply = EventBuilder::text_note_reply("reply body", &parent, None, None)
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let mut app = App::new(true, Vec::new());
+        app.on_ui_event(UiEvent::Event(Box::new(reply.clone())));
+
+        let pending = app.reply_display(&reply).unwrap();
+        assert_eq!(pending.event_id, parent.id);
+        assert!(pending.event.is_none());
+        assert!(app
+            .reference_commands()
+            .iter()
+            .any(|command| matches!(command, Command::FetchEvent(id) if *id == parent.id)));
+        assert!(!app
+            .reference_commands()
+            .iter()
+            .any(|command| matches!(command, Command::FetchEvent(id) if *id == parent.id)));
+
+        app.on_ui_event(UiEvent::ReferencedEvent {
+            event_id: parent.id,
+            event: Some(Box::new(parent.clone())),
+        });
+
+        assert_eq!(
+            app.reply_display(&reply)
+                .and_then(|reply| reply.event)
+                .map(|event| event.content),
+            Some("parent body".to_owned())
+        );
+    }
+
+    #[test]
+    fn reply_chains_target_the_immediate_parent() {
+        let root = EventBuilder::text_note("root")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let parent = EventBuilder::text_note_reply("parent", &root, None, None)
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let reply = EventBuilder::text_note_reply("reply", &parent, Some(&root), None)
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+
+        assert_eq!(reply_target_id(&reply), Some(parent.id));
+    }
+
+    #[test]
+    fn recognizes_legacy_positional_reply_tags() {
+        let root = EventBuilder::text_note("root")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let parent = EventBuilder::text_note("parent")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let reply = EventBuilder::text_note("legacy reply")
+            .tags([Tag::event(root.id), Tag::event(parent.id)])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+
+        assert_eq!(reply_target_id(&reply), Some(parent.id));
+    }
+
+    #[test]
+    fn indexed_event_mentions_are_not_mistaken_for_replies() {
+        let mentioned = EventBuilder::text_note("mentioned")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let note = EventBuilder::text_note("see #[0]")
+            .tags([Tag::event(mentioned.id)])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+
+        assert_eq!(reply_target_id(&note), None);
     }
 
     #[test]

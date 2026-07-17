@@ -12,7 +12,9 @@ use ratatui_image::{FilterType, Resize, StatefulImage};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, CustomEmoji, InputMode, QuoteDisplay, RenderedPart, TimelineTab};
+use crate::app::{
+    App, CustomEmoji, InputMode, QuoteDisplay, RenderedPart, ReplyDisplay, TimelineTab,
+};
 
 const ACCENT: Color = Color::Rgb(180, 140, 255);
 const DIM: Color = Color::Rgb(130, 135, 150);
@@ -161,6 +163,9 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         if let Some(reposter) = reposted_by.as_ref() {
             lines.push(repost_line(app, reposter, AVATAR_INDENT));
         }
+        if let Some(reply) = app.reply_display(&display.event).as_ref() {
+            lines.push(reply_line(app, reply, AVATAR_INDENT));
+        }
         let avatar_row = lines.len() as u16;
         lines.push(Line::from(vec![
             Span::raw(AVATAR_INDENT),
@@ -270,6 +275,42 @@ fn repost_line(app: &App, reposter: &PublicKey, indent: &str) -> Line<'static> {
             Style::default().fg(Color::Yellow).bold(),
         ),
     ])
+}
+
+fn reply_line(app: &App, reply: &ReplyDisplay, indent: &str) -> Line<'static> {
+    let mut spans = vec![
+        Span::raw(indent.to_owned()),
+        Span::styled("↳ Reply to ", Style::default().fg(Color::Cyan)),
+    ];
+    if let Some(event) = reply.event.as_ref() {
+        spans.push(Span::styled(
+            app.author_name(&event.pubkey),
+            Style::default().fg(Color::Cyan).bold(),
+        ));
+        spans.push(Span::styled(" · ", Style::default().fg(DIM)));
+        spans.extend(compact_content_spans(
+            &app.rendered_content(event).parts,
+            100,
+        ));
+    } else {
+        let id = reply
+            .event_id
+            .to_bech32()
+            .unwrap_or_else(|_| reply.event_id.to_string());
+        spans.push(Span::styled(
+            format!(
+                "{} · {}",
+                compact(&id, 22),
+                if reply.loading {
+                    "loading…"
+                } else {
+                    "unavailable"
+                }
+            ),
+            Style::default().fg(DIM),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn quote_lines(app: &App, quote: &QuoteDisplay, indent: &str) -> Vec<Line<'static>> {
@@ -521,7 +562,12 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let rendered = app.rendered_content(&display.event);
     let content_layout =
         detailed_content_layout(app, &rendered.parts, area.width.saturating_sub(2));
-    let mut body_lines = content_layout.lines;
+    let mut body_lines = Vec::new();
+    if let Some(reply) = app.reply_display(&display.event).as_ref() {
+        body_lines.push(reply_line(app, reply, ""));
+        body_lines.push(Line::raw(""));
+    }
+    body_lines.extend(content_layout.lines);
     let mut content_images = content_layout.images;
     if let Some(quote) = rendered.quote.as_ref() {
         body_lines.push(Line::raw(""));
@@ -938,6 +984,51 @@ mod tests {
             .unwrap();
 
         assert_eq!(original_row, repost_row + 1);
+    }
+
+    #[test]
+    fn reply_context_is_rendered_above_the_reply() {
+        let parent_author = Keys::generate();
+        let reply_author = Keys::generate();
+        let parent = EventBuilder::text_note("parent body")
+            .custom_created_at(Timestamp::from_secs(100))
+            .sign_with_keys(&parent_author)
+            .unwrap();
+        let reply = EventBuilder::text_note_reply("reply body", &parent, None, None)
+            .custom_created_at(Timestamp::from_secs(200))
+            .sign_with_keys(&reply_author)
+            .unwrap();
+        let mut app = App::new(true, Vec::new());
+        app.profiles.insert(
+            parent_author.public_key().to_hex(),
+            Profile {
+                display_name: Some("Alice".to_owned()),
+                ..Profile::default()
+            },
+        );
+        app.on_ui_event(UiEvent::Event(Box::new(parent)));
+        app.on_ui_event(UiEvent::Event(Box::new(reply)));
+        let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let rows = (0..terminal.backend().buffer().area.height)
+            .map(|y| {
+                (0..terminal.backend().buffer().area.width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let context_row = rows
+            .iter()
+            .position(|row| row.contains("Reply to Alice · parent body"))
+            .unwrap();
+        let reply_row = rows
+            .iter()
+            .position(|row| row.contains("reply body"))
+            .unwrap();
+
+        assert!(context_row < reply_row);
     }
 
     #[test]
