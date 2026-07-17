@@ -50,10 +50,11 @@ async fn main() -> Result<()> {
         limit: args.limit,
     };
     let read_only = config.secret_key.is_none();
+    let relays = config.relays.clone();
     let network_task = tokio::spawn(network::run(config, command_rx, ui_tx));
 
     let mut terminal = setup_terminal()?;
-    let mut app = App::new(read_only);
+    let mut app = App::new(read_only, relays);
     let result = run_app(&mut terminal, &mut app, command_tx, &mut ui_rx).await;
 
     restore_terminal(&mut terminal)?;

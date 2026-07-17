@@ -90,6 +90,10 @@ pub struct App {
     pub status: String,
     pub identity: String,
     pub read_only: bool,
+    settings_open: bool,
+    relays: Vec<String>,
+    live: bool,
+    unseen: usize,
     seen: HashSet<String>,
     pending_nip05: HashSet<(String, String)>,
     pending_profiles: HashSet<String>,
@@ -97,7 +101,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(read_only: bool) -> Self {
+    pub fn new(read_only: bool, relays: Vec<String>) -> Self {
         Self {
             timeline: Vec::new(),
             selected: 0,
@@ -110,6 +114,10 @@ impl App {
             status: "starting…".to_owned(),
             identity: "loading…".to_owned(),
             read_only,
+            settings_open: false,
+            relays,
+            live: true,
+            unseen: 0,
             seen: HashSet::new(),
             pending_nip05: HashSet::new(),
             pending_profiles: HashSet::new(),
@@ -172,6 +180,8 @@ impl App {
                 self.apply_profile(pubkey, &event.content)
             }
             Kind::TextNote | Kind::Repost => {
+                let selected_id = self.selected_event().map(|event| event.id);
+                let incoming_id = event.id;
                 let profile_key = if event.kind == Kind::Repost {
                     Event::from_json(&event.content)
                         .ok()
@@ -182,8 +192,23 @@ impl App {
                 };
                 self.timeline.push(event);
                 self.timeline.sort_by_key(|event| Reverse(event.created_at));
-                if self.selected >= self.timeline.len() {
-                    self.selected = self.timeline.len().saturating_sub(1);
+                if self.live {
+                    self.selected = 0;
+                    self.unseen = 0;
+                } else {
+                    self.selected = selected_id
+                        .and_then(|id| self.timeline.iter().position(|event| event.id == id))
+                        .unwrap_or_else(|| {
+                            self.selected.min(self.timeline.len().saturating_sub(1))
+                        });
+                    if self
+                        .timeline
+                        .iter()
+                        .position(|event| event.id == incoming_id)
+                        .is_some_and(|position| position < self.selected)
+                    {
+                        self.unseen += 1;
+                    }
                 }
                 let key = profile_key.to_hex();
                 if !self.profiles.contains_key(&key) && self.pending_profiles.insert(key) {
@@ -229,6 +254,16 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return None;
         }
+        if self.settings_open {
+            return match key.code {
+                KeyCode::Char('m') | KeyCode::Esc => {
+                    self.settings_open = false;
+                    None
+                }
+                KeyCode::Char('q') => Some(Command::Quit),
+                _ => None,
+            };
+        }
         match self.mode.clone() {
             InputMode::Normal => self.on_normal_key(key),
             InputMode::Compose { reply_to } => self.on_input_key(key, reply_to, None),
@@ -239,23 +274,33 @@ impl App {
     fn on_normal_key(&mut self, key: KeyEvent) -> Option<Command> {
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), _) => Some(Command::Quit),
+            (KeyCode::Char('m'), _) => {
+                self.settings_open = true;
+                None
+            }
             (KeyCode::Char('j') | KeyCode::Down, _) => {
+                self.pause_timeline();
                 self.selected = (self.selected + 1).min(self.timeline.len().saturating_sub(1));
                 None
             }
             (KeyCode::Char('k') | KeyCode::Up, _) => {
+                self.pause_timeline();
                 self.selected = self.selected.saturating_sub(1);
                 None
             }
             (KeyCode::Char('g'), _) => {
                 self.selected = 0;
+                self.live = true;
+                self.unseen = 0;
                 None
             }
             (KeyCode::Char('G'), _) => {
+                self.pause_timeline();
                 self.selected = self.timeline.len().saturating_sub(1);
                 None
             }
             (KeyCode::Char('l') | KeyCode::Enter, _) => {
+                self.pause_timeline();
                 self.detail = true;
                 None
             }
@@ -376,6 +421,28 @@ impl App {
         }
         self.mode = InputMode::Compose { reply_to };
         self.input.clear();
+    }
+
+    fn pause_timeline(&mut self) {
+        if !self.timeline.is_empty() {
+            self.live = false;
+        }
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.live
+    }
+
+    pub fn unseen_count(&self) -> usize {
+        self.unseen
+    }
+
+    pub fn settings_open(&self) -> bool {
+        self.settings_open
+    }
+
+    pub fn relays(&self) -> &[String] {
+        &self.relays
     }
 
     pub fn selected_event(&self) -> Option<&Event> {
@@ -506,5 +573,76 @@ mod tests {
         reactions.add("+");
         reactions.add("🔥");
         assert_eq!(reactions.summary(), "+1 🔥2");
+    }
+
+    #[test]
+    fn incoming_notes_do_not_change_the_selected_event() {
+        let keys = Keys::generate();
+        let note = |content, timestamp| {
+            EventBuilder::text_note(content)
+                .custom_created_at(Timestamp::from_secs(timestamp))
+                .sign_with_keys(&keys)
+                .unwrap()
+        };
+        let mut app = App::new(true, Vec::new());
+        let selected = note("selected", 100);
+        let selected_id = selected.id;
+
+        app.add_event(selected);
+        app.add_event(note("older", 50));
+        app.selected = 0;
+        app.live = false;
+        app.add_event(note("incoming", 200));
+
+        assert_eq!(app.selected, 1);
+        assert_eq!(app.unseen_count(), 1);
+        assert_eq!(
+            app.selected_event().map(|event| event.id),
+            Some(selected_id)
+        );
+    }
+
+    #[test]
+    fn live_timeline_follows_newest_and_g_resumes_it() {
+        let keys = Keys::generate();
+        let note = |content, timestamp| {
+            EventBuilder::text_note(content)
+                .custom_created_at(Timestamp::from_secs(timestamp))
+                .sign_with_keys(&keys)
+                .unwrap()
+        };
+        let mut app = App::new(true, Vec::new());
+        app.add_event(note("first", 100));
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.add_event(note("new while paused", 200));
+
+        assert!(!app.is_live());
+        assert_eq!(app.unseen_count(), 1);
+        assert_eq!(
+            app.selected_event().map(|event| event.content.as_str()),
+            Some("first")
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.add_event(note("new while live", 300));
+
+        assert!(app.is_live());
+        assert_eq!(app.unseen_count(), 0);
+        assert_eq!(
+            app.selected_event().map(|event| event.content.as_str()),
+            Some("new while live")
+        );
+    }
+
+    #[test]
+    fn m_toggles_the_settings_modal() {
+        let mut app = App::new(true, vec!["wss://relay.example.com".to_owned()]);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(app.settings_open());
+        assert_eq!(app.relays(), ["wss://relay.example.com"]);
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.settings_open());
     }
 }

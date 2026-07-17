@@ -35,9 +35,10 @@ cargo run -- --relay wss://relay.example.com --relay wss://relay2.example.com
 | キー | 操作 |
 | --- | --- |
 | `j` / `k` | 下 / 上へ移動 |
-| `g` / `G` | 先頭 / 末尾へ移動 |
+| `g` / `G` | 先頭へ移動してLIVE再開 / 末尾へ移動 |
 | `l` / `Enter` | 詳細を開く |
 | `h` / `Esc` | 詳細を閉じる |
+| `m` | 設定を開く |
 | `i` / `o` | 新規投稿 |
 | `r` | 選択ノートへ返信 |
 | `+` / `-` | Like / Dislike |
@@ -46,6 +47,8 @@ cargo run -- --relay wss://relay.example.com --relay wss://relay2.example.com
 | `Ctrl-S` | 入力を送信 |
 | `Esc` | 入力を破棄 |
 | `q` | 終了 |
+
+TLは通常LIVE状態で新着へ追従します。`j` / `k` / `G`で移動するか詳細を開くとPAUSEDになり、選択中の投稿を維持したまま新着を上へ蓄積します。`g`で先頭へ戻るとLIVEへ復帰します。
 
 > [!IMPORTANT]
 > NIP-08は廃止済み仕様ですが、指定された既存イベントとの互換性のため対応しています。投稿時の `@npub...` / `nostr:npub...` / `nostr:note...` は `#[index]` と対応タグへ変換されます。
