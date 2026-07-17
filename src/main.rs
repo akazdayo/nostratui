@@ -11,11 +11,16 @@ use clap::Parser;
 use crossterm::{
     event::{self, Event as TerminalEvent},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+        EnterAlternateScreen, LeaveAlternateScreen,
+    },
 };
 use network::{NetworkConfig, UiEvent};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
+
+const MAX_TERMINAL_EVENTS_PER_FRAME: usize = 64;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -100,29 +105,72 @@ async fn run_app(
         flush_deleted_images(terminal, app)?;
 
         if needs_redraw {
-            terminal.draw(|frame| ui::draw(frame, app))?;
+            draw_frame(terminal, app)?;
             needs_redraw = false;
         }
 
         if event::poll(Duration::from_millis(50))? {
-            match event::read()? {
-                TerminalEvent::Key(key) => {
-                    needs_redraw = true;
-                    if let Some(command) = app.on_key(key) {
-                        if matches!(command, Command::Quit) {
-                            return Ok(());
-                        }
-                        command_tx
-                            .send(command)
-                            .await
-                            .context("network task stopped")?;
-                    }
-                }
-                TerminalEvent::Resize(_, _) => needs_redraw = true,
-                _ => {}
+            let mut events = Vec::with_capacity(MAX_TERMINAL_EVENTS_PER_FRAME);
+            events.push(event::read()?);
+            while events.len() < MAX_TERMINAL_EVENTS_PER_FRAME && event::poll(Duration::ZERO)? {
+                events.push(event::read()?);
+            }
+
+            let batch = apply_terminal_events(app, events);
+            if batch.quit {
+                return Ok(());
+            }
+            needs_redraw |= batch.needs_redraw;
+            for command in batch.commands {
+                command_tx
+                    .send(command)
+                    .await
+                    .context("network task stopped")?;
             }
         }
     }
+}
+
+#[derive(Default)]
+struct TerminalEventBatch {
+    needs_redraw: bool,
+    quit: bool,
+    commands: Vec<Command>,
+}
+
+fn apply_terminal_events(
+    app: &mut App,
+    events: impl IntoIterator<Item = TerminalEvent>,
+) -> TerminalEventBatch {
+    let mut batch = TerminalEventBatch::default();
+    for terminal_event in events {
+        match terminal_event {
+            TerminalEvent::Key(key) => {
+                batch.needs_redraw = true;
+                if let Some(command) = app.on_key(key) {
+                    if matches!(command, Command::Quit) {
+                        batch.quit = true;
+                        break;
+                    }
+                    batch.commands.push(command);
+                }
+            }
+            TerminalEvent::Resize(_, _) => batch.needs_redraw = true,
+            _ => {}
+        }
+    }
+    batch
+}
+
+fn draw_frame(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> io::Result<()> {
+    execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let draw_result = terminal.draw(|frame| ui::draw(frame, app)).map(|_| ());
+    // Always release synchronized mode, including when drawing fails.
+    let end_result = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    draw_result.and(end_result)
 }
 
 fn flush_deleted_images(
@@ -158,4 +206,34 @@ fn install_panic_hook() {
         let _ = execute!(stdout, LeaveAlternateScreen);
         original(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use nostr_sdk::prelude::*;
+
+    use super::*;
+
+    #[test]
+    fn rapid_scroll_events_are_applied_as_one_redraw_batch() {
+        let keys = Keys::generate();
+        let mut app = App::new(true, Vec::new());
+        for timestamp in 1..=100 {
+            let event = EventBuilder::text_note(format!("note {timestamp}"))
+                .custom_created_at(Timestamp::from_secs(timestamp))
+                .sign_with_keys(&keys)
+                .unwrap();
+            app.on_ui_event(UiEvent::Event(Box::new(event)));
+        }
+        let events = (0..40)
+            .map(|_| TerminalEvent::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)));
+
+        let batch = apply_terminal_events(&mut app, events);
+
+        assert_eq!(app.selected_index(), 40);
+        assert!(batch.needs_redraw);
+        assert!(!batch.quit);
+        assert!(batch.commands.is_empty());
+    }
 }
