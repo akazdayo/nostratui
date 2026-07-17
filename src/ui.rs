@@ -110,15 +110,40 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
-    let mut items = Vec::with_capacity(app.timeline().len());
-    let mut item_heights = Vec::with_capacity(app.timeline().len());
-    let mut authors = Vec::with_capacity(app.timeline().len());
-    let mut item_emojis = Vec::with_capacity(app.timeline().len());
+    let title = format!(" {} timeline ", app.active_tab().label());
+    let block = Block::default().title(title).borders(Borders::ALL);
+    if app.timeline().is_empty() {
+        let message = if app.active_tab() == TimelineTab::Following && !app.following_available() {
+            "Following timeline requires NOSTR_SECRET_KEY"
+        } else if app.active_tab() == TimelineTab::Following {
+            "No notes from followed accounts yet"
+        } else {
+            "No notes received yet"
+        };
+        frame.render_widget(
+            Paragraph::new(message)
+                .style(Style::default().fg(DIM))
+                .block(block),
+            area,
+        );
+        app.sync_timeline_viewport(0);
+        return;
+    }
+
+    let inner = block.inner(area);
+    let timeline_len = app.timeline().len();
+    let selected = app.selected_index().min(timeline_len - 1);
+    let (window_start, window_end) = timeline_render_window(timeline_len, selected, inner.height);
+    let window_len = window_end - window_start;
+    let mut items = Vec::with_capacity(window_len);
+    let mut item_heights = Vec::with_capacity(window_len);
+    let mut authors = Vec::with_capacity(window_len);
+    let mut item_emojis = Vec::with_capacity(window_len);
     let content_width = area
         .width
         .saturating_sub(2 + 2 + AVATAR_INDENT.width() as u16)
         .min(180);
-    for event in app.timeline() {
+    for event in &app.timeline()[window_start..window_end] {
         let display = app.display_event(event);
         let author = app.author_name(&display.event.pubkey);
         let nip05 = app
@@ -179,35 +204,20 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         items.push(ListItem::new(Text::from(lines)));
     }
 
-    let title = format!(" {} timeline ", app.active_tab().label());
-    let block = Block::default().title(title).borders(Borders::ALL);
-    if app.timeline().is_empty() {
-        let message = if app.active_tab() == TimelineTab::Following && !app.following_available() {
-            "Following timeline requires NOSTR_SECRET_KEY"
-        } else if app.active_tab() == TimelineTab::Following {
-            "No notes from followed accounts yet"
-        } else {
-            "No notes received yet"
-        };
-        frame.render_widget(
-            Paragraph::new(message)
-                .style(Style::default().fg(DIM))
-                .block(block),
-            area,
-        );
-        app.sync_timeline_viewport(0);
-        return;
-    }
-    let inner = block.inner(area);
     let list = List::new(items)
         .block(block)
         .highlight_symbol("▌ ")
         .highlight_style(Style::default().bg(Color::Rgb(35, 30, 48)));
+    let relative_offset = app
+        .timeline_offset()
+        .saturating_sub(window_start)
+        .min(window_len - 1);
+    let relative_selected = selected - window_start;
     let mut state = ListState::default()
-        .with_offset(app.timeline_offset())
-        .with_selected(Some(app.selected_index()));
+        .with_offset(relative_offset)
+        .with_selected(Some(relative_selected));
     frame.render_stateful_widget(list, area, &mut state);
-    app.sync_timeline_viewport(state.offset());
+    app.sync_timeline_viewport(window_start + state.offset());
 
     if inner.width < AVATAR_WIDTH + 2 {
         return;
@@ -233,6 +243,22 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         render_custom_emojis(frame, app, emojis, (inner.x + 2, y), inner);
         y = y.saturating_add(*height);
     }
+}
+
+fn timeline_render_window(
+    timeline_len: usize,
+    selected: usize,
+    viewport_height: u16,
+) -> (usize, usize) {
+    // One item per terminal row on each side is a conservative overscan;
+    // timeline items currently occupy several rows each.
+    let overscan = usize::from(viewport_height).max(1);
+    let start = selected.saturating_sub(overscan);
+    let end = selected
+        .saturating_add(overscan)
+        .saturating_add(1)
+        .min(timeline_len);
+    (start, end)
 }
 
 fn repost_line(app: &App, reposter: &PublicKey, indent: &str) -> Line<'static> {
@@ -839,12 +865,19 @@ mod tests {
         network::UiEvent,
     };
 
-    use super::{compact, content_span, draw, editor_layout, EditorLayout};
+    use super::{compact, content_span, draw, editor_layout, timeline_render_window, EditorLayout};
 
     #[test]
     fn compact_handles_unicode() {
         assert_eq!(compact("こんにちは", 3), "こんに…");
         assert_eq!(compact("abc", 3), "abc");
+    }
+
+    #[test]
+    fn timeline_render_window_is_bounded_around_the_selection() {
+        assert_eq!(timeline_render_window(5_000, 0, 33), (0, 34));
+        assert_eq!(timeline_render_window(5_000, 2_500, 33), (2_467, 2_534));
+        assert_eq!(timeline_render_window(5_000, 4_999, 33), (4_966, 5_000));
     }
 
     #[test]
@@ -965,6 +998,39 @@ mod tests {
         assert!(!app.is_live());
 
         app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.selected_index(), 0);
+        assert_eq!(app.timeline_offset(), 0);
+        assert!(app.is_live());
+    }
+
+    #[test]
+    fn virtualized_timeline_keeps_global_scroll_state() {
+        let keys = Keys::generate();
+        let mut app = App::new(true, Vec::new());
+        for timestamp in 1..=100 {
+            let event = EventBuilder::text_note(format!("note {timestamp}"))
+                .custom_created_at(Timestamp::from_secs(timestamp))
+                .sign_with_keys(&keys)
+                .unwrap();
+            app.on_ui_event(UiEvent::Event(Box::new(event)));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 15)).unwrap();
+
+        app.on_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.selected_index(), 99);
+        assert!(app.timeline_offset() > 0);
+        assert!(app.timeline_offset() <= app.selected_index());
+
+        for _ in 0..15 {
+            app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        }
+        assert_eq!(app.selected_index(), 84);
+        assert!(app.timeline_offset() <= app.selected_index());
+
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(app.selected_index(), 0);
         assert_eq!(app.timeline_offset(), 0);
