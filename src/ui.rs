@@ -9,6 +9,8 @@ use ratatui::{
     Frame,
 };
 use ratatui_image::{FilterType, Resize, StatefulImage};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, InputMode};
 
@@ -129,6 +131,7 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut state =
         ListState::default().with_selected((!app.timeline.is_empty()).then_some(app.selected));
     frame.render_stateful_widget(list, area, &mut state);
+    app.sync_timeline_viewport(state.offset());
 
     if inner.width < AVATAR_WIDTH + 2 {
         return;
@@ -284,26 +287,76 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_editor(frame: &mut Frame, app: &App, area: Rect, title: &str) {
+    let inner_width = area.width.saturating_sub(2).max(1);
+    let inner_height = area.height.saturating_sub(2).max(1);
+    let layout = editor_layout(&app.input, inner_width);
+    let scroll = layout
+        .cursor_row
+        .saturating_sub(usize::from(inner_height.saturating_sub(1)));
+    let text = Text::from(
+        layout
+            .lines
+            .iter()
+            .map(|line| Line::raw(line.as_str()))
+            .collect::<Vec<_>>(),
+    );
     frame.render_widget(
-        Paragraph::new(app.input.as_str())
+        Paragraph::new(text)
             .block(Block::default().title(title).borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         area,
     );
-    let last_line = app.input.rsplit('\n').next().unwrap_or("");
-    let x = area.x
-        + 1
-        + last_line
-            .chars()
-            .count()
-            .min(area.width.saturating_sub(3) as usize) as u16;
-    let line_count = app
-        .input
-        .chars()
-        .filter(|character| *character == '\n')
-        .count();
-    let y = area.y + 1 + (line_count as u16).min(area.height.saturating_sub(3));
+    let x = area.x + 1 + layout.cursor_column.min(usize::from(inner_width - 1)) as u16;
+    let visible_row = layout.cursor_row.saturating_sub(scroll);
+    let y = area.y + 1 + visible_row.min(usize::from(inner_height - 1)) as u16;
     frame.set_cursor_position((x, y));
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct EditorLayout {
+    lines: Vec<String>,
+    cursor_column: usize,
+    cursor_row: usize,
+}
+
+/// Hard-wraps editor input using the same terminal-cell widths used by ratatui.
+/// Grapheme clusters keep combining characters and emoji sequences together.
+fn editor_layout(input: &str, width: u16) -> EditorLayout {
+    let width = usize::from(width.max(1));
+    let mut lines = vec![String::new()];
+    let mut column: usize = 0;
+
+    for grapheme in input.graphemes(true) {
+        if grapheme == "\n" {
+            lines.push(String::new());
+            column = 0;
+            continue;
+        }
+
+        let grapheme_width = grapheme.width();
+        if grapheme_width > 0 && column > 0 && column.saturating_add(grapheme_width) > width {
+            lines.push(String::new());
+            column = 0;
+        }
+        lines
+            .last_mut()
+            .expect("editor always has a line")
+            .push_str(grapheme);
+        column = column.saturating_add(grapheme_width);
+    }
+
+    // Once the final cell is occupied, the insertion cursor belongs at the
+    // beginning of the next visual row.
+    if column >= width {
+        lines.push(String::new());
+        column = 0;
+    }
+
+    EditorLayout {
+        cursor_column: column,
+        cursor_row: lines.len() - 1,
+        lines,
+    }
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -412,11 +465,72 @@ fn compact(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::compact;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use nostr_sdk::prelude::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    use crate::{app::App, network::UiEvent};
+
+    use super::{compact, draw, editor_layout, EditorLayout};
 
     #[test]
     fn compact_handles_unicode() {
         assert_eq!(compact("こんにちは", 3), "こんに…");
         assert_eq!(compact("abc", 3), "abc");
+    }
+
+    #[test]
+    fn editor_cursor_uses_terminal_width_for_japanese() {
+        assert_eq!(
+            editor_layout("abc日本語", 20),
+            EditorLayout {
+                lines: vec!["abc日本語".to_owned()],
+                cursor_column: 9,
+                cursor_row: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn editor_cursor_tracks_unicode_wrapping_and_newlines() {
+        assert_eq!(
+            editor_layout("日本語\nか\u{3099}", 4),
+            EditorLayout {
+                lines: vec!["日本".to_owned(), "語".to_owned(), "か\u{3099}".to_owned()],
+                cursor_column: 2,
+                cursor_row: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn timeline_is_live_until_the_viewport_scrolls_from_the_top() {
+        let keys = Keys::generate();
+        let mut app = App::new(true, Vec::new());
+        for (content, timestamp) in [("newest", 300), ("middle", 200), ("oldest", 100)] {
+            let event = EventBuilder::text_note(content)
+                .custom_created_at(Timestamp::from_secs(timestamp))
+                .sign_with_keys(&keys)
+                .unwrap();
+            app.on_ui_event(UiEvent::Event(Box::new(event)));
+        }
+        // At this height exactly two timeline items fit in the viewport.
+        let mut terminal = Terminal::new(TestBackend::new(80, 15)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.selected, 1);
+        assert!(app.is_live());
+
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.selected, 2);
+        assert!(!app.is_live());
+
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.selected, 1);
+        assert!(app.is_live());
     }
 }

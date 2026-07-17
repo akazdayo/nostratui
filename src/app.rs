@@ -305,19 +305,16 @@ impl App {
                 None
             }
             (KeyCode::Char('j') | KeyCode::Down, _) => {
-                self.pause_timeline();
                 self.selected = (self.selected + 1).min(self.timeline.len().saturating_sub(1));
                 None
             }
             (KeyCode::Char('k') | KeyCode::Up, _) => {
-                self.pause_timeline();
                 self.selected = self.selected.saturating_sub(1);
                 None
             }
             (KeyCode::Char('g'), _) => {
                 self.selected = 0;
-                self.live = true;
-                self.unseen = 0;
+                self.resume_timeline();
                 None
             }
             (KeyCode::Char('G'), _) => {
@@ -451,6 +448,19 @@ impl App {
 
     fn pause_timeline(&mut self) {
         if !self.timeline.is_empty() {
+            self.live = false;
+        }
+    }
+
+    fn resume_timeline(&mut self) {
+        self.live = true;
+        self.unseen = 0;
+    }
+
+    pub fn sync_timeline_viewport(&mut self, offset: usize) {
+        if offset == 0 && !self.detail {
+            self.resume_timeline();
+        } else {
             self.live = false;
         }
     }
@@ -705,7 +715,7 @@ mod tests {
         };
         let mut app = App::new(true, Vec::new());
         app.add_event(note("first", 100));
-        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.sync_timeline_viewport(1);
         app.add_event(note("new while paused", 200));
 
         assert!(!app.is_live());
@@ -724,6 +734,18 @@ mod tests {
             app.selected_event().map(|event| event.content.as_str()),
             Some("new while live")
         );
+    }
+
+    #[test]
+    fn timeline_mode_tracks_the_rendered_viewport() {
+        let mut app = App::new(true, Vec::new());
+
+        app.sync_timeline_viewport(1);
+        assert!(!app.is_live());
+
+        app.sync_timeline_viewport(0);
+        assert!(app.is_live());
+        assert_eq!(app.unseen_count(), 0);
     }
 
     #[test]
