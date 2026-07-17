@@ -115,6 +115,15 @@ pub(super) struct InlineLayout {
     pub(super) images: Vec<InlineImage>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct PostImage {
+    pub(super) row: u16,
+    pub(super) column: u16,
+    pub(super) width: u16,
+    pub(super) height: u16,
+    pub(super) url: String,
+}
+
 pub(super) fn compact_content_line(app: &App, parts: &[RenderedPart], width: u16) -> InlineLine {
     let mut spans = Vec::new();
     let mut images = Vec::new();
@@ -296,4 +305,42 @@ pub(super) fn render_custom_emojis(
         );
         let _ = protocol.last_encoding_result();
     }
+}
+
+pub(super) fn render_post_images(
+    frame: &mut Frame,
+    app: &mut App,
+    images: &[PostImage],
+    origin: (u16, u16),
+    clip: Rect,
+) {
+    for image in images {
+        let x = origin.0.saturating_add(image.column);
+        let y = origin.1.saturating_add(image.row);
+        if image.width == 0
+            || image.height == 0
+            || x < clip.x
+            || y < clip.y
+            || x.saturating_add(image.width) > clip.right()
+            || y.saturating_add(image.height) > clip.bottom()
+        {
+            continue;
+        }
+        let Some(protocol) = app.post_image_protocol_mut(&image.url) else {
+            continue;
+        };
+        frame.render_stateful_widget(
+            // Post images are normalized to a bounded pixel size while decoding.
+            // `Fit` does not upscale sources that are already smaller than the
+            // target cell area, leaving most of the reserved preview blank.
+            StatefulImage::default().resize(post_image_resize()),
+            Rect::new(x, y, image.width, image.height),
+            protocol,
+        );
+        let _ = protocol.last_encoding_result();
+    }
+}
+
+pub(super) fn post_image_resize() -> Resize {
+    Resize::Scale(Some(FilterType::Triangle))
 }

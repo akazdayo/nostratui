@@ -86,6 +86,29 @@ fn completed_custom_emoji_is_ready_for_inline_rendering() {
 }
 
 #[test]
+fn preview_size_uses_image_and_terminal_cell_aspect_ratios() {
+    let mut cache = enabled_cache();
+    let cases = [
+        ("wide", (128, 72), (24, 7)),
+        ("square", (128, 128), (16, 8)),
+        ("portrait", (64, 128), (8, 8)),
+    ];
+
+    for (name, (width, height), expected) in cases {
+        let key = format!("post:{name}");
+        let url = format!("https://example.com/{name}.png");
+        assert!(cache.request(&key, &url));
+        cache.complete(
+            key.clone(),
+            url.clone(),
+            Some(DynamicImage::new_rgba8(width, height)),
+        );
+
+        assert_eq!(cache.preview_size(&key, &url, 24, 8), Some(expected));
+    }
+}
+
+#[test]
 fn decoded_cache_evicts_and_releases_kitty_ids() {
     let mut cache = enabled_cache();
     for index in 0..MAX_CACHED_IMAGES + 3 {

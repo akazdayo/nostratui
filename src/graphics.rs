@@ -17,6 +17,7 @@ const MAX_PENDING_IMAGES: usize = 8;
 struct CacheEntry {
     url: String,
     protocol: Option<StatefulProtocol>,
+    pixel_size: Option<(u32, u32)>,
 }
 
 /// A bounded terminal-image cache. `None` protocols are negative cache entries.
@@ -112,14 +113,21 @@ impl ImageCache {
         }
         self.pending.remove(&key);
 
+        let pixel_size = image.as_ref().map(|image| (image.width(), image.height()));
         let protocol = image.and_then(|image| {
             self.picker
                 .as_ref()
                 .map(|picker| picker.new_resize_protocol(image))
         });
         self.remove_entry(&key);
-        self.entries
-            .insert(key.clone(), CacheEntry { url, protocol });
+        self.entries.insert(
+            key.clone(),
+            CacheEntry {
+                url,
+                protocol,
+                pixel_size,
+            },
+        );
         self.touch(&key);
         self.evict_to_limit();
     }
@@ -152,6 +160,45 @@ impl ImageCache {
         self.entries
             .get_mut(key)
             .and_then(|entry| entry.protocol.as_mut())
+    }
+
+    /// Returns a tight cell rectangle preserving the image's pixel aspect
+    /// ratio and accounting for non-square terminal cells.
+    pub fn preview_size(
+        &self,
+        key: &str,
+        url: &str,
+        max_width: u16,
+        max_height: u16,
+    ) -> Option<(u16, u16)> {
+        if max_width == 0 || max_height == 0 {
+            return None;
+        }
+        let entry = self.entries.get(key)?;
+        if entry.url != url || entry.protocol.is_none() {
+            return None;
+        }
+        let (image_width, image_height) = entry.pixel_size?;
+        let (cell_width, cell_height) = self.picker.as_ref()?.font_size();
+        if image_width == 0 || image_height == 0 || cell_width == 0 || cell_height == 0 {
+            return None;
+        }
+
+        let height = div_ceil(
+            u64::from(image_height) * u64::from(max_width) * u64::from(cell_width),
+            u64::from(image_width) * u64::from(cell_height),
+        )
+        .max(1);
+        if height <= u64::from(max_height) {
+            return Some((max_width, height as u16));
+        }
+
+        let width = div_ceil(
+            u64::from(image_width) * u64::from(max_height) * u64::from(cell_height),
+            u64::from(image_height) * u64::from(cell_width),
+        )
+        .clamp(1, u64::from(max_width));
+        Some((width as u16, max_height))
     }
 
     pub fn take_deleted_ids(&mut self) -> Vec<u32> {
@@ -190,6 +237,10 @@ impl ImageCache {
             self.deleted_ids.push(id);
         }
     }
+}
+
+fn div_ceil(numerator: u64, denominator: u64) -> u64 {
+    numerator / denominator + u64::from(!numerator.is_multiple_of(denominator))
 }
 
 fn kitty_terminal_from_env_values(

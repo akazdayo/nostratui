@@ -59,12 +59,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 mod presentation;
 mod timeline;
 
-#[cfg(test)]
-use presentation::content_span;
 use presentation::{
     compact_content_line, detailed_content_layout, quote_lines, render_avatar,
-    render_custom_emojis, reply_line, repost_line,
+    render_custom_emojis, render_post_images, reply_line, repost_line, PostImage,
 };
+#[cfg(test)]
+use presentation::{content_span, post_image_resize};
 #[cfg(test)]
 use timeline::timeline_render_window;
 use timeline::{draw_detail, draw_timeline};

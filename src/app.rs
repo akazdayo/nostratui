@@ -320,7 +320,8 @@ mod resources;
 use content::custom_emoji_references;
 use content::{
     avatar_image_key, content_entities, embedded_repost, emoji_image_key, is_repost,
-    reply_target_id, repost_target_id, used_custom_emojis, ContentEntityKind,
+    post_image_key, post_image_urls, reply_target_id, repost_target_id, used_custom_emojis,
+    ContentEntityKind,
 };
 pub use content::{expand_mentions, CustomEmoji, QuoteDisplay, RenderedPart, ReplyDisplay};
 #[cfg(test)]

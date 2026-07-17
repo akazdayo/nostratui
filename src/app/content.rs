@@ -63,6 +63,7 @@ impl App {
 
     pub fn rendered_content(&self, event: &Event) -> RenderedContent {
         let content = expand_mentions(&event.content, &event.tags);
+        let image_urls = post_image_urls(event);
         let mut parts = Vec::new();
         let mut cursor = 0;
         let mut quote = None;
@@ -100,7 +101,11 @@ impl App {
         trim_content_parts(&mut parts);
         parts = emojify_parts(parts, &custom_emoji_tags(&event.tags));
 
-        RenderedContent { parts, quote }
+        RenderedContent {
+            parts,
+            quote,
+            image_urls,
+        }
     }
 
     pub fn author_name(&self, pubkey: &PublicKey) -> String {
@@ -146,6 +151,7 @@ pub struct DisplayEvent {
 pub struct RenderedContent {
     pub parts: Vec<RenderedPart>,
     pub quote: Option<QuoteDisplay>,
+    pub image_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,6 +373,108 @@ pub(super) fn avatar_image_key(pubkey: &str) -> String {
 
 pub(super) fn emoji_image_key(url: &str) -> String {
     format!("emoji:{url}")
+}
+
+pub(super) fn post_image_key(url: &str) -> String {
+    format!("post:{url}")
+}
+
+/// Extracts a small, ordered set of image links from note content and NIP-92
+/// `imeta` tags. Plain links need a supported file extension; metadata may
+/// identify extensionless image URLs by MIME type.
+pub(super) fn post_image_urls(event: &Event) -> Vec<String> {
+    const MAX_IMAGES_PER_POST: usize = 4;
+
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
+    for token in event.content.split_whitespace() {
+        let lowercase = token.to_ascii_lowercase();
+        let Some(start) = lowercase.find("https://") else {
+            continue;
+        };
+        let candidate = trim_url_punctuation(&token[start..]);
+        if is_supported_image_url(candidate) && seen.insert(candidate.to_owned()) {
+            urls.push(candidate.to_owned());
+            if urls.len() == MAX_IMAGES_PER_POST {
+                return urls;
+            }
+        }
+    }
+
+    for tag in event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().is_some_and(|kind| kind == "imeta"))
+    {
+        let mut url = None;
+        let mut image_mime = false;
+        for value in tag.as_slice().iter().skip(1) {
+            if let Some(value) = value.strip_prefix("url ") {
+                url = Some(trim_url_punctuation(value));
+            } else if value
+                .strip_prefix("m ")
+                .is_some_and(|mime| mime.to_ascii_lowercase().starts_with("image/"))
+            {
+                image_mime = true;
+            }
+        }
+        let Some(url) = url.filter(|url| image_mime || is_supported_image_url(url)) else {
+            continue;
+        };
+        if is_safe_https_url(url) && seen.insert(url.to_owned()) {
+            urls.push(url.to_owned());
+            if urls.len() == MAX_IMAGES_PER_POST {
+                break;
+            }
+        }
+    }
+    urls
+}
+
+fn trim_url_punctuation(url: &str) -> &str {
+    url.trim_matches(|character: char| {
+        matches!(
+            character,
+            '(' | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | '"'
+                | '\''
+                | ','
+                | '.'
+                | ':'
+                | ';'
+                | '!'
+                | '?'
+                | '。'
+                | '、'
+        )
+    })
+}
+
+fn is_supported_image_url(url: &str) -> bool {
+    if !is_safe_https_url(url) {
+        return false;
+    }
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"]
+        .iter()
+        .any(|extension| path.ends_with(extension))
+}
+
+fn is_safe_https_url(url: &str) -> bool {
+    url.len() <= 2_048
+        && url
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
 }
 
 fn trim_content_parts(parts: &mut Vec<RenderedPart>) {

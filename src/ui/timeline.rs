@@ -1,5 +1,8 @@
 use super::*;
 
+const POST_IMAGE_MAX_WIDTH: u16 = 24;
+const POST_IMAGE_MAX_HEIGHT: u16 = 8;
+
 pub(super) fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = format!(" {} timeline ", app.active_tab().label());
     let block = Block::default().title(title).borders(Borders::ALL);
@@ -30,6 +33,7 @@ pub(super) fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut item_heights = Vec::with_capacity(window_len);
     let mut authors = Vec::with_capacity(window_len);
     let mut item_emojis = Vec::with_capacity(window_len);
+    let mut item_post_images = Vec::with_capacity(window_len);
     let content_width = area
         .width
         .saturating_sub(2 + 2 + AVATAR_INDENT.width() as u16)
@@ -71,6 +75,24 @@ pub(super) fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         if let Some(quote) = rendered.quote.as_ref() {
             lines.extend(quote_lines(app, quote, AVATAR_INDENT));
         }
+        let mut post_images = Vec::new();
+        if let Some((url, (width, height))) = rendered.image_urls.iter().find_map(|url| {
+            app.post_image_preview_size(
+                url,
+                content_width.min(POST_IMAGE_MAX_WIDTH),
+                POST_IMAGE_MAX_HEIGHT,
+            )
+            .map(|size| (url, size))
+        }) {
+            post_images.push(PostImage {
+                row: lines.len() as u16,
+                column: AVATAR_INDENT.width() as u16,
+                width,
+                height,
+                url: url.clone(),
+            });
+            lines.extend(std::iter::repeat_with(|| Line::raw(AVATAR_INDENT)).take(height as usize));
+        }
         let reaction_row = lines.len() as u16;
         let mut reaction_spans = vec![Span::raw(AVATAR_INDENT)];
         reaction_spans.extend(reactions.spans.into_iter().map(|mut span| {
@@ -95,6 +117,7 @@ pub(super) fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
             image
         }));
         item_emojis.push(emojis);
+        item_post_images.push(post_images);
         items.push(ListItem::new(Text::from(lines)));
     }
 
@@ -118,10 +141,11 @@ pub(super) fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let first = state.offset();
     let mut y = inner.y;
-    for (((pubkey, avatar_row), height), emojis) in authors
+    for ((((pubkey, avatar_row), height), emojis), post_images) in authors
         .iter()
         .zip(item_heights.iter())
         .zip(item_emojis.iter())
+        .zip(item_post_images.iter())
         .skip(first)
     {
         if y.saturating_add(*height) > inner.bottom() {
@@ -135,6 +159,7 @@ pub(super) fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         );
         render_avatar(frame, app, pubkey, avatar_area);
         render_custom_emojis(frame, app, emojis, (inner.x + 2, y), inner);
+        render_post_images(frame, app, post_images, (inner.x + 2, y), inner);
         y = y.saturating_add(*height);
     }
 }
@@ -208,6 +233,25 @@ pub(super) fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     if let Some(quote) = rendered.quote.as_ref() {
         body_lines.push(Line::raw(""));
         body_lines.extend(quote_lines(app, quote, ""));
+    }
+    let mut post_images = Vec::new();
+    if let Some((url, (width, height))) = rendered.image_urls.iter().find_map(|url| {
+        app.post_image_preview_size(
+            url,
+            area.width.saturating_sub(2).min(POST_IMAGE_MAX_WIDTH),
+            POST_IMAGE_MAX_HEIGHT,
+        )
+        .map(|size| (url, size))
+    }) {
+        body_lines.push(Line::raw(""));
+        post_images.push(PostImage {
+            row: body_lines.len() as u16,
+            column: 0,
+            width,
+            height,
+            url: url.clone(),
+        });
+        body_lines.extend(std::iter::repeat_with(|| Line::raw("")).take(height as usize));
     }
     body_lines.extend([
         Line::raw(""),
@@ -283,6 +327,13 @@ pub(super) fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
             (body_area.x, body_area.y),
             body_area,
         );
+        render_post_images(
+            frame,
+            app,
+            &post_images,
+            (body_area.x, body_area.y),
+            body_area,
+        );
     } else {
         let content_y = inner.y + header_lines.len() as u16 + 1;
         header_lines.push(Line::raw(""));
@@ -292,5 +343,6 @@ pub(super) fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
             inner,
         );
         render_custom_emojis(frame, app, &content_images, (inner.x, content_y), inner);
+        render_post_images(frame, app, &post_images, (inner.x, content_y), inner);
     }
 }

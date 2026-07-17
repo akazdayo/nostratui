@@ -114,6 +114,63 @@ fn custom_emoji_download_completion_becomes_renderable() {
 }
 
 #[test]
+fn extracts_supported_image_links_from_note_content() {
+    let event = EventBuilder::text_note(
+        "photo (https://cdn.example.com/Cat.JPEG?size=large). page https://example.com/about",
+    )
+    .sign_with_keys(&Keys::generate())
+    .unwrap();
+    let app = App::new(true, Vec::new());
+
+    assert_eq!(
+        app.rendered_content(&event).image_urls,
+        vec!["https://cdn.example.com/Cat.JPEG?size=large"]
+    );
+}
+
+#[test]
+fn extracts_extensionless_nip92_image_links() {
+    let image_url = "https://cdn.example.com/blob/abc123";
+    let event = EventBuilder::text_note(format!("photo {image_url}"))
+        .tags([
+            Tag::parse(["imeta", &format!("url {image_url}"), "m image/png"]).unwrap(),
+            Tag::parse(["imeta", "url http://example.com/unsafe", "m image/png"]).unwrap(),
+        ])
+        .sign_with_keys(&Keys::generate())
+        .unwrap();
+    let app = App::new(true, Vec::new());
+
+    assert_eq!(app.rendered_content(&event).image_urls, vec![image_url]);
+}
+
+#[test]
+fn post_image_download_completion_becomes_renderable() {
+    let image_url = "https://cdn.example.com/photo.webp";
+    let event = EventBuilder::text_note(format!("look {image_url}"))
+        .sign_with_keys(&Keys::generate())
+        .unwrap();
+    let mut app = App::new(true, Vec::new());
+    app.set_image_cache(ImageCache::kitty_for_test());
+    app.on_ui_event(UiEvent::Event(Box::new(event)));
+
+    let command = app
+        .image_commands()
+        .into_iter()
+        .find(|command| matches!(command, Command::FetchImage { url, .. } if url == image_url))
+        .unwrap();
+    let Command::FetchImage { key, url } = command else {
+        unreachable!();
+    };
+    app.on_ui_event(UiEvent::Image {
+        key,
+        url,
+        image: Some(::image::DynamicImage::new_rgba8(32, 32)),
+    });
+
+    assert_eq!(app.post_image_preview_size(image_url, 24, 8), Some((16, 8)));
+}
+
+#[test]
 fn custom_emoji_parser_skips_url_colons_and_finds_later_shortcode() {
     let tags = HashMap::from([(
         "party".to_owned(),

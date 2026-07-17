@@ -39,6 +39,12 @@ impl App {
                     candidates.push((image_key, emoji.url));
                 }
             }
+            for url in post_image_urls(&display.event) {
+                let image_key = post_image_key(&url);
+                if unique_images.insert(image_key.clone()) {
+                    candidates.push((image_key, url));
+                }
+            }
             if let Some(reactions) = self.reactions.get(&display.event.id.to_string()) {
                 for url in reactions.custom_emojis.values() {
                     let image_key = emoji_image_key(url);
@@ -182,6 +188,23 @@ impl App {
     ) -> Option<&mut ratatui_image::protocol::StatefulProtocol> {
         self.images
             .protocol_mut(&emoji_image_key(&emoji.url), &emoji.url)
+    }
+
+    pub fn post_image_preview_size(
+        &self,
+        url: &str,
+        max_width: u16,
+        max_height: u16,
+    ) -> Option<(u16, u16)> {
+        self.images
+            .preview_size(&post_image_key(url), url, max_width, max_height)
+    }
+
+    pub fn post_image_protocol_mut(
+        &mut self,
+        url: &str,
+    ) -> Option<&mut ratatui_image::protocol::StatefulProtocol> {
+        self.images.protocol_mut(&post_image_key(url), url)
     }
 
     pub fn take_deleted_image_ids(&mut self) -> Vec<u32> {

@@ -11,7 +11,10 @@ use crate::{
     network::UiEvent,
 };
 
-use super::{compact, content_span, draw, editor_layout, timeline_render_window, EditorLayout};
+use super::{
+    compact, content_span, draw, editor_layout, post_image_resize, timeline_render_window,
+    EditorLayout,
+};
 
 #[test]
 fn compact_handles_unicode() {
@@ -34,6 +37,14 @@ fn mention_span_has_distinct_style() {
     assert_eq!(mention.style.fg, Some(Color::Cyan));
     assert!(mention.style.add_modifier.contains(Modifier::BOLD));
     assert_eq!(body.style.fg, None);
+}
+
+#[test]
+fn post_images_are_upscaled_to_the_reserved_preview_area() {
+    assert!(matches!(
+        post_image_resize(),
+        ratatui_image::Resize::Scale(_)
+    ));
 }
 
 #[test]
