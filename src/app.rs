@@ -727,6 +727,25 @@ mod tests {
     }
 
     #[test]
+    fn locally_published_note_and_relay_echo_are_shown_once() {
+        let event = EventBuilder::text_note("my post")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let event_id = event.id;
+        let mut app = App::new(false, Vec::new());
+
+        app.on_ui_event(UiEvent::Event(Box::new(event.clone())));
+        app.on_ui_event(UiEvent::Event(Box::new(event)));
+
+        assert_eq!(app.timeline.len(), 1);
+        assert_eq!(app.selected_event().map(|event| event.id), Some(event_id));
+        assert_eq!(
+            app.selected_event().map(|event| event.content.as_str()),
+            Some("my post")
+        );
+    }
+
+    #[test]
     fn m_toggles_the_settings_modal() {
         let mut app = App::new(true, vec!["wss://relay.example.com".to_owned()]);
 

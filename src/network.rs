@@ -195,10 +195,20 @@ async fn handle_command(
                 None => EventBuilder::text_note(content),
             }
             .tags(mention_tags);
-            client
-                .send_event_builder(builder)
-                .await
-                .map(|output| format!("published {}", short_id(&output.id().to_string())))
+            match client.sign_event_builder(builder).await {
+                Ok(event) => match client.send_event(&event).await {
+                    Ok(output) => {
+                        // A relay is not required to echo a newly accepted event back to
+                        // our subscription. Forward the exact signed event to the UI so
+                        // the post appears immediately; a later relay echo is harmless
+                        // because App deduplicates events by ID.
+                        let _ = ui_tx.send(UiEvent::Event(Box::new(event))).await;
+                        Ok(format!("published {}", short_id(&output.id().to_string())))
+                    }
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            }
         }
         Command::React { event, reaction } => client
             .send_event_builder(EventBuilder::reaction(&*event, reaction))
