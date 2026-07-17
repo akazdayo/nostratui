@@ -25,7 +25,7 @@ pub(super) fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_editor(frame: &mut Frame, app: &App, area: Rect, title: &str) {
     let inner_width = area.width.saturating_sub(2).max(1);
     let inner_height = area.height.saturating_sub(2).max(1);
-    let layout = editor_layout(&app.input, inner_width);
+    let layout = editor_layout(&app.input, app.input_cursor(), inner_width);
     let scroll = layout
         .cursor_row
         .saturating_sub(usize::from(inner_height.saturating_sub(1)));
@@ -57,7 +57,28 @@ pub(super) struct EditorLayout {
 
 /// Hard-wraps editor input using the same terminal-cell widths used by ratatui.
 /// Grapheme clusters keep combining characters and emoji sequences together.
-pub(super) fn editor_layout(input: &str, width: u16) -> EditorLayout {
+pub(super) fn editor_layout(input: &str, cursor: usize, width: u16) -> EditorLayout {
+    debug_assert!(cursor <= input.len() && input.is_char_boundary(cursor));
+    let (cursor_column, cursor_row) = wrapped_lines(&input[..cursor], width, true);
+    let (_, _, lines) = wrapped_lines_with_content(input, width, true);
+
+    EditorLayout {
+        lines,
+        cursor_column,
+        cursor_row,
+    }
+}
+
+fn wrapped_lines(input: &str, width: u16, trailing_cursor_row: bool) -> (usize, usize) {
+    let (column, row, _) = wrapped_lines_with_content(input, width, trailing_cursor_row);
+    (column, row)
+}
+
+fn wrapped_lines_with_content(
+    input: &str,
+    width: u16,
+    trailing_cursor_row: bool,
+) -> (usize, usize, Vec<String>) {
     let width = usize::from(width.max(1));
     let mut lines = vec![String::new()];
     let mut column: usize = 0;
@@ -83,14 +104,10 @@ pub(super) fn editor_layout(input: &str, width: u16) -> EditorLayout {
 
     // Once the final cell is occupied, the insertion cursor belongs at the
     // beginning of the next visual row.
-    if column >= width {
+    if trailing_cursor_row && column >= width {
         lines.push(String::new());
         column = 0;
     }
 
-    EditorLayout {
-        cursor_column: column,
-        cursor_row: lines.len() - 1,
-        lines,
-    }
+    (column, lines.len() - 1, lines)
 }

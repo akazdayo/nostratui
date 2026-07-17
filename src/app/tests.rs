@@ -1,6 +1,50 @@
 use super::*;
 
 mod content;
+
+#[test]
+fn compose_cursor_moves_and_edits_at_grapheme_boundaries() {
+    let mut app = App::new(false, Vec::new());
+    let press = |app: &mut App, code| {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    };
+
+    press(&mut app, KeyCode::Char('i'));
+    for character in ['a', '日', 'b'] {
+        press(&mut app, KeyCode::Char(character));
+    }
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Char('X'));
+
+    assert_eq!(app.input, "aX日b");
+    assert_eq!(app.input_cursor(), "aX".len());
+
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Backspace);
+    assert_eq!(app.input, "aXb");
+    assert_eq!(app.input_cursor(), "aX".len());
+
+    press(&mut app, KeyCode::Delete);
+    assert_eq!(app.input, "aX");
+}
+
+#[test]
+fn compose_cursor_moves_between_lines_and_to_line_edges() {
+    let mut app = App::new(false, Vec::new());
+    app.mode = InputMode::Compose { reply_to: None };
+    app.input = "abc\n日本語".to_owned();
+    app.input_cursor = app.input.len();
+
+    app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(app.input_cursor(), 3);
+    app.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+    assert_eq!(app.input_cursor(), 0);
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(app.input_cursor(), 4);
+    app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    assert_eq!(app.input_cursor(), app.input.len());
+}
 #[test]
 fn incoming_notes_do_not_change_the_selected_event() {
     let keys = Keys::generate();

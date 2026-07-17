@@ -145,7 +145,7 @@ fn reply_context_is_rendered_above_the_reply() {
 #[test]
 fn editor_cursor_uses_terminal_width_for_japanese() {
     assert_eq!(
-        editor_layout("abc日本語", 20),
+        editor_layout("abc日本語", "abc日本語".len(), 20),
         EditorLayout {
             lines: vec!["abc日本語".to_owned()],
             cursor_column: 9,
@@ -157,11 +157,23 @@ fn editor_cursor_uses_terminal_width_for_japanese() {
 #[test]
 fn editor_cursor_tracks_unicode_wrapping_and_newlines() {
     assert_eq!(
-        editor_layout("日本語\nか\u{3099}", 4),
+        editor_layout("日本語\nか\u{3099}", "日本語\nか\u{3099}".len(), 4),
         EditorLayout {
             lines: vec!["日本".to_owned(), "語".to_owned(), "か\u{3099}".to_owned()],
             cursor_column: 2,
             cursor_row: 2,
+        }
+    );
+}
+
+#[test]
+fn editor_cursor_can_be_rendered_inside_unicode_input() {
+    assert_eq!(
+        editor_layout("日本語", "日本".len(), 4),
+        EditorLayout {
+            lines: vec!["日本".to_owned(), "語".to_owned()],
+            cursor_column: 0,
+            cursor_row: 1,
         }
     );
 }

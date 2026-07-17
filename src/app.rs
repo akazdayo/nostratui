@@ -180,6 +180,7 @@ pub struct App {
     pub reactions: HashMap<String, Reactions>,
     pub mode: InputMode,
     pub input: String,
+    input_cursor: usize,
     pub detail: bool,
     pub status: String,
     pub identity: String,
@@ -209,6 +210,7 @@ impl App {
             reactions: HashMap::new(),
             mode: InputMode::Normal,
             input: String::new(),
+            input_cursor: 0,
             detail: false,
             status: "starting…".to_owned(),
             identity: "loading…".to_owned(),
@@ -308,6 +310,10 @@ impl App {
 
     pub fn relays(&self) -> &[String] {
         &self.relays
+    }
+
+    pub fn input_cursor(&self) -> usize {
+        self.input_cursor
     }
 }
 

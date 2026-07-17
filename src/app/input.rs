@@ -1,4 +1,5 @@
 use super::*;
+use unicode_segmentation::UnicodeSegmentation;
 
 impl App {
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Command> {
@@ -124,6 +125,7 @@ impl App {
                         event: Box::new(event),
                     };
                     self.input.clear();
+                    self.input_cursor = 0;
                 }
                 None
             }
@@ -149,6 +151,7 @@ impl App {
         if key.code == KeyCode::Esc {
             self.mode = InputMode::Normal;
             self.input.clear();
+            self.input_cursor = 0;
             self.status = "cancelled".to_owned();
             return None;
         }
@@ -160,6 +163,7 @@ impl App {
             }
             self.mode = InputMode::Normal;
             self.input.clear();
+            self.input_cursor = 0;
             self.status = "sending…".to_owned();
             return if let Some(event) = reaction_to {
                 Some(Command::React {
@@ -177,13 +181,44 @@ impl App {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                self.input.push(character)
+                self.input.insert(self.input_cursor, character);
+                self.input_cursor += character.len_utf8();
             }
-            KeyCode::Enter if reaction_to.is_none() => self.input.push('\n'),
+            KeyCode::Enter if reaction_to.is_none() => {
+                self.input.insert(self.input_cursor, '\n');
+                self.input_cursor += '\n'.len_utf8();
+            }
             KeyCode::Backspace => {
-                self.input.pop();
+                let previous = previous_grapheme_boundary(&self.input, self.input_cursor);
+                self.input.replace_range(previous..self.input_cursor, "");
+                self.input_cursor = previous;
             }
-            KeyCode::Tab => self.input.push('\t'),
+            KeyCode::Delete => {
+                let next = next_grapheme_boundary(&self.input, self.input_cursor);
+                self.input.replace_range(self.input_cursor..next, "");
+            }
+            KeyCode::Left => {
+                self.input_cursor = previous_grapheme_boundary(&self.input, self.input_cursor);
+            }
+            KeyCode::Right => {
+                self.input_cursor = next_grapheme_boundary(&self.input, self.input_cursor);
+            }
+            KeyCode::Home => {
+                self.input_cursor = line_start(&self.input, self.input_cursor);
+            }
+            KeyCode::End => {
+                self.input_cursor = line_end(&self.input, self.input_cursor);
+            }
+            KeyCode::Up => {
+                self.input_cursor = move_to_adjacent_line(&self.input, self.input_cursor, false);
+            }
+            KeyCode::Down => {
+                self.input_cursor = move_to_adjacent_line(&self.input, self.input_cursor, true);
+            }
+            KeyCode::Tab => {
+                self.input.insert(self.input_cursor, '\t');
+                self.input_cursor += '\t'.len_utf8();
+            }
             _ => {}
         }
         None
@@ -196,5 +231,54 @@ impl App {
         }
         self.mode = InputMode::Compose { reply_to };
         self.input.clear();
+        self.input_cursor = 0;
     }
+}
+
+fn previous_grapheme_boundary(input: &str, cursor: usize) -> usize {
+    input[..cursor]
+        .grapheme_indices(true)
+        .next_back()
+        .map_or(0, |(index, _)| index)
+}
+
+fn next_grapheme_boundary(input: &str, cursor: usize) -> usize {
+    input[cursor..]
+        .graphemes(true)
+        .next()
+        .map_or(cursor, |grapheme| cursor + grapheme.len())
+}
+
+fn line_start(input: &str, cursor: usize) -> usize {
+    input[..cursor].rfind('\n').map_or(0, |index| index + 1)
+}
+
+fn line_end(input: &str, cursor: usize) -> usize {
+    input[cursor..]
+        .find('\n')
+        .map_or(input.len(), |index| cursor + index)
+}
+
+fn move_to_adjacent_line(input: &str, cursor: usize, down: bool) -> usize {
+    let current_start = line_start(input, cursor);
+    let column = input[current_start..cursor].graphemes(true).count();
+    let (target_start, target_end) = if down {
+        let current_end = line_end(input, cursor);
+        if current_end == input.len() {
+            return cursor;
+        }
+        let target_start = current_end + 1;
+        (target_start, line_end(input, target_start))
+    } else {
+        if current_start == 0 {
+            return cursor;
+        }
+        let target_end = current_start - 1;
+        (line_start(input, target_end), target_end)
+    };
+
+    input[target_start..target_end]
+        .grapheme_indices(true)
+        .nth(column)
+        .map_or(target_end, |(index, _)| target_start + index)
 }
