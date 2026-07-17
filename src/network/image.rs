@@ -4,8 +4,13 @@ const MAX_IMAGE_DOWNLOAD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 2_048;
 const MAX_IMAGE_DECODE_ALLOC: u64 = 32 * 1024 * 1024;
 pub(super) const CACHED_IMAGE_SIZE: u32 = 128;
+pub(super) const DETAIL_IMAGE_SIZE: u32 = 512;
 
-pub(super) async fn fetch_image(http: &HttpClient, url: &str) -> anyhow::Result<DynamicImage> {
+pub(super) async fn fetch_image(
+    http: &HttpClient,
+    url: &str,
+    target_size: u32,
+) -> anyhow::Result<DynamicImage> {
     let mut response = http.get(url).send().await?.error_for_status()?;
     if response
         .content_length()
@@ -30,20 +35,20 @@ pub(super) async fn fetch_image(http: &HttpClient, url: &str) -> anyhow::Result<
         anyhow::bail!("empty image response");
     }
 
-    tokio::task::spawn_blocking(move || decode_image(bytes))
+    tokio::task::spawn_blocking(move || decode_image(bytes, target_size))
         .await
         .map_err(|error| anyhow::anyhow!("image decoder task failed: {error}"))?
 }
 
-pub(super) fn decode_image(bytes: Vec<u8>) -> anyhow::Result<DynamicImage> {
-    decode_raster_image(&bytes).or_else(|raster_error| {
-        decode_svg_image(&bytes).map_err(|svg_error| {
+pub(super) fn decode_image(bytes: Vec<u8>, target_size: u32) -> anyhow::Result<DynamicImage> {
+    decode_raster_image(&bytes, target_size).or_else(|raster_error| {
+        decode_svg_image(&bytes, target_size).map_err(|svg_error| {
             anyhow::anyhow!("unsupported raster image ({raster_error}); invalid SVG ({svg_error})")
         })
     })
 }
 
-fn decode_raster_image(bytes: &[u8]) -> anyhow::Result<DynamicImage> {
+fn decode_raster_image(bytes: &[u8], target_size: u32) -> anyhow::Result<DynamicImage> {
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
     limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
@@ -56,12 +61,12 @@ fn decode_raster_image(bytes: &[u8]) -> anyhow::Result<DynamicImage> {
     // dropped before the event crosses into the UI task.
     Ok(DynamicImage::ImageRgba8(
         image
-            .resize(CACHED_IMAGE_SIZE, CACHED_IMAGE_SIZE, FilterType::Triangle)
+            .resize(target_size, target_size, FilterType::Triangle)
             .to_rgba8(),
     ))
 }
 
-fn decode_svg_image(bytes: &[u8]) -> anyhow::Result<DynamicImage> {
+fn decode_svg_image(bytes: &[u8], target_size: u32) -> anyhow::Result<DynamicImage> {
     // `from_data_nested` deliberately ignores external file references. The
     // SVG itself is untrusted relay content and must not read local resources.
     let tree = resvg::usvg::Tree::from_data_nested(bytes, &resvg::usvg::Options::default())?;
@@ -78,8 +83,7 @@ fn decode_svg_image(bytes: &[u8]) -> anyhow::Result<DynamicImage> {
         anyhow::bail!("SVG dimensions are invalid or exceed the limit");
     }
 
-    let scale =
-        (CACHED_IMAGE_SIZE as f32 / source_width).min(CACHED_IMAGE_SIZE as f32 / source_height);
+    let scale = (target_size as f32 / source_width).min(target_size as f32 / source_height);
     let width = (source_width * scale).round().max(1.0) as u32;
     let height = (source_height * scale).round().max(1.0) as u32;
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)

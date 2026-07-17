@@ -34,7 +34,7 @@ fn image_decoder_normalizes_retained_size() {
         .write_to(&mut encoded, ImageFormat::Png)
         .unwrap();
 
-    let decoded = decode_image(encoded.into_inner()).unwrap();
+    let decoded = decode_image(encoded.into_inner(), CACHED_IMAGE_SIZE).unwrap();
     assert!(decoded.width() <= CACHED_IMAGE_SIZE);
     assert!(decoded.height() <= CACHED_IMAGE_SIZE);
 }
@@ -46,7 +46,7 @@ fn image_decoder_rejects_excessive_dimensions() {
         .write_to(&mut encoded, ImageFormat::Png)
         .unwrap();
 
-    assert!(decode_image(encoded.into_inner()).is_err());
+    assert!(decode_image(encoded.into_inner(), CACHED_IMAGE_SIZE).is_err());
 }
 
 #[test]
@@ -55,7 +55,7 @@ fn image_decoder_rasterizes_svg_custom_emoji() {
             <rect width="32" height="16" fill="#ff0000"/>
         </svg>"##;
 
-    let decoded = decode_image(svg.to_vec()).unwrap();
+    let decoded = decode_image(svg.to_vec(), CACHED_IMAGE_SIZE).unwrap();
 
     assert_eq!(decoded.width(), CACHED_IMAGE_SIZE);
     assert_eq!(decoded.height(), CACHED_IMAGE_SIZE / 2);
@@ -68,5 +68,5 @@ fn image_decoder_rasterizes_svg_custom_emoji() {
 #[test]
 fn image_decoder_rejects_oversized_svg_dimensions() {
     let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="2049" height="16"/>"#;
-    assert!(decode_image(svg.to_vec()).is_err());
+    assert!(decode_image(svg.to_vec(), CACHED_IMAGE_SIZE).is_err());
 }

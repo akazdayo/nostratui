@@ -61,7 +61,8 @@ mod timeline;
 
 use presentation::{
     compact_content_line, detailed_content_layout, quote_lines, render_avatar,
-    render_custom_emojis, render_post_images, reply_line, repost_line, PostImage,
+    render_custom_emojis, render_detail_post_images, render_post_images, reply_line, repost_line,
+    PostImage,
 };
 #[cfg(test)]
 use presentation::{content_span, post_image_resize};
