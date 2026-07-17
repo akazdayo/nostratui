@@ -74,8 +74,10 @@ async fn run_app(
     command_tx: mpsc::Sender<Command>,
     ui_rx: &mut mpsc::Receiver<UiEvent>,
 ) -> Result<()> {
+    let mut needs_redraw = true;
     loop {
         while let Ok(message) = ui_rx.try_recv() {
+            needs_redraw = true;
             if let Some(command) = app.on_ui_event(message) {
                 command_tx
                     .send(command)
@@ -97,19 +99,27 @@ async fn run_app(
 
         flush_deleted_images(terminal, app)?;
 
-        terminal.draw(|frame| ui::draw(frame, app))?;
+        if needs_redraw {
+            terminal.draw(|frame| ui::draw(frame, app))?;
+            needs_redraw = false;
+        }
 
         if event::poll(Duration::from_millis(50))? {
-            if let TerminalEvent::Key(key) = event::read()? {
-                if let Some(command) = app.on_key(key) {
-                    if matches!(command, Command::Quit) {
-                        return Ok(());
+            match event::read()? {
+                TerminalEvent::Key(key) => {
+                    needs_redraw = true;
+                    if let Some(command) = app.on_key(key) {
+                        if matches!(command, Command::Quit) {
+                            return Ok(());
+                        }
+                        command_tx
+                            .send(command)
+                            .await
+                            .context("network task stopped")?;
                     }
-                    command_tx
-                        .send(command)
-                        .await
-                        .context("network task stopped")?;
                 }
+                TerminalEvent::Resize(_, _) => needs_redraw = true,
+                _ => {}
             }
         }
     }
