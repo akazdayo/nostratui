@@ -112,8 +112,13 @@ async fn run_app(
         if event::poll(Duration::from_millis(50))? {
             let mut events = Vec::with_capacity(MAX_TERMINAL_EVENTS_PER_FRAME);
             events.push(event::read()?);
-            while events.len() < MAX_TERMINAL_EVENTS_PER_FRAME && event::poll(Duration::ZERO)? {
-                events.push(event::read()?);
+            while should_drain_terminal_events(&events) && event::poll(Duration::ZERO)? {
+                let terminal_event = event::read()?;
+                let stops_batch = is_scroll_event(&terminal_event);
+                events.push(terminal_event);
+                if stops_batch {
+                    break;
+                }
             }
 
             let batch = apply_terminal_events(app, events);
@@ -129,6 +134,23 @@ async fn run_app(
             }
         }
     }
+}
+
+fn should_drain_terminal_events(events: &[TerminalEvent]) -> bool {
+    events.len() < MAX_TERMINAL_EVENTS_PER_FRAME && !events.iter().any(is_scroll_event)
+}
+
+fn is_scroll_event(terminal_event: &TerminalEvent) -> bool {
+    matches!(
+        terminal_event,
+        TerminalEvent::Key(key)
+            if matches!(
+                key.code,
+                crossterm::event::KeyCode::Char('j' | 'k')
+                    | crossterm::event::KeyCode::Down
+                    | crossterm::event::KeyCode::Up
+            )
+    )
 }
 
 #[derive(Default)]
@@ -216,7 +238,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rapid_scroll_events_are_applied_as_one_redraw_batch() {
+    fn scroll_event_ends_the_current_redraw_batch() {
+        let scroll = TerminalEvent::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+
+        assert!(!should_drain_terminal_events(&[scroll]));
+    }
+
+    #[test]
+    fn consecutive_scroll_events_are_applied_on_separate_frames() {
         let keys = Keys::generate();
         let mut app = App::new(true, Vec::new());
         for timestamp in 1..=100 {
@@ -226,14 +255,19 @@ mod tests {
                 .unwrap();
             app.on_ui_event(UiEvent::Event(Box::new(event)));
         }
-        let events = (0..40)
-            .map(|_| TerminalEvent::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)));
+        let scroll = || {
+            [TerminalEvent::Key(KeyEvent::new(
+                KeyCode::Char('j'),
+                KeyModifiers::NONE,
+            ))]
+        };
 
-        let batch = apply_terminal_events(&mut app, events);
+        let first_frame = apply_terminal_events(&mut app, scroll());
+        assert_eq!(app.selected_index(), 1);
+        let second_frame = apply_terminal_events(&mut app, scroll());
 
-        assert_eq!(app.selected_index(), 40);
-        assert!(batch.needs_redraw);
-        assert!(!batch.quit);
-        assert!(batch.commands.is_empty());
+        assert_eq!(app.selected_index(), 2);
+        assert!(first_frame.needs_redraw);
+        assert!(second_frame.needs_redraw);
     }
 }
